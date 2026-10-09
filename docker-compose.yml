@@ -1,9 +1,29 @@
 version: '3.8'
 
 services:
-  discord-bot:
-    build: .
+  db:
+    image: postgres:15
+    container_name: ticket-db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password # ⚠️ À changer
+      POSTGRES_DB: ticket_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  bot:
+    image: ghcr.io/aallaann1/discordticket:latest
     container_name: discord-ticket-bot
-    restart: unless-stopped
+    restart: always
+    ports:
+      - "8000:8000" # Expose l'API pour ton Frontend web
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db/ticket_db
+    depends_on:
+      - db
+
+volumes:
+  postgres_data: null
