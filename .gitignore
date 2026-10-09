@@ -1,0 +1,32 @@
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
