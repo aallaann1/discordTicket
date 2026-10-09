@@ -17,7 +17,7 @@ services:
     container_name: discord-ticket-bot
     restart: always
     ports:
-      - "8000:8000" # Expose l'API pour ton Frontend web
+      - "8010:8000" # Expose l'API pour ton Frontend web (Port 8010 en local)
     env_file:
       - .env
     environment:

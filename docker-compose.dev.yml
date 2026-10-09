@@ -1,0 +1,9 @@
+version: '3.8'
+
+# Ce fichier surcharge le docker-compose.yml principal pour le développement local.
+# Au lieu de télécharger l'image depuis GitHub (ghcr.io), il va construire l'image avec le code local (build: .).
+
+services:
+  bot:
+    build: .
+    image: discordticket-local:latest
