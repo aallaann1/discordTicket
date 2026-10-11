@@ -13,9 +13,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   bot:
-    image: ghcr.io/aallaann1/discordticket:latest
+    build: .
     container_name: discord-ticket-bot
     restart: always
+    volumes:
+      - .:/app
     ports:
       - "8010:8000" # Expose l'API pour ton Frontend web (Port 8010 en local)
     env_file:

@@ -1,163 +1,143 @@
-# 📚 Documentation API Complète : Discord Ticketing Bot
+# 📚 Documentation API Complète : Bot Ticketing Discord
 
-Cette documentation décrit exhaustivement l'API REST permettant à ton Frontend de gérer la configuration du bot Discord, de consulter les statistiques et d'afficher les archives de tickets.
+Cette documentation est destinée au développeur Frontend. Elle détaille l'intégralité du fonctionnement, des modèles de données et des routes REST nécessaires pour configurer et piloter le Bot Discord depuis une interface web.
 
 ---
 
-## 🔐 1. Sécurité et Authentification
+## 🔐 1. Sécurité et Point d'accès
 
-L'API est strictement privée. Toute requête doit comporter l'en-tête suivant :
+L'API est strictement privée. L'authentification se fait via un header HTTP obligatoire pour **chaque** requête.
+
+*   **Header d'authentification** : `X-API-Key`
+*   **Valeur** : La clé secrète définie dans le fichier `.env` du serveur.
+*   **URL de base locale** : `http://localhost:8010/api` *(Attention, le port est 8010 en local).*
+*   **Swagger (Test interactif)** : `http://localhost:8010/docs`
+
+> ⚠️ *Si le Header est manquant ou invalide, l'API retourne systématiquement une erreur `403 Forbidden`.*
+
+---
+
+## 🛠️ 2. Workflow Général (Comment concevoir le Front)
+
+Pour que l'utilisateur crée un bouton de Ticket fonctionnel sur Discord, le Frontend doit suivre ces étapes :
+
+1.  **Récupérer le contexte Discord** : Appeler `/api/discord/channels` pour lister les serveurs, salons, et (idéalement) rôles et catégories. Cela te permettra de remplir les listes déroulantes de ton formulaire web.
+2.  **Créer le Panel** : Envoyer un `POST /api/panels` avec les options graphiques du bouton et de l'embed.
+3.  **Ajouter les Questions** : Envoyer des `POST /api/panels/{id}/fields` pour lier des questions à ce bouton. **⚠️ LIMITÉ À 5 QUESTIONS MAXIMALES (Restriction stricte de Discord).**
+4.  **Déployer sur Discord** : Appeler `POST /api/panels/{id}/send?channel_id=...` pour ordonner au bot de publier le bouton final dans le salon Discord choisi.
+
+---
+
+## 📦 3. Modèles de Données (Dictionnaire)
+
+### Objet `Panel` (La configuration visuelle et logique)
+Représente le "Bouton" physique sur Discord et ce qui se passe quand on clique dessus.
+
 ```json
 {
-  "X-API-Key": "ta_cle_secrete_definie_dans_le_env"
+  "id": 1,
+  "name": "WTB / Achats", 
+  
+  // Customisation de l'Embed (Le message au-dessus du bouton)
+  "embed_title": "Vendre vos items",
+  "embed_description": "Cliquez ci-dessous pour proposer vos items.",
+  "embed_color": "#2ecc71", // Obligatoire : Code Hexadécimal
+  
+  // Customisation du Bouton
+  "button_text": "Proposer des articles",
+  "button_emoji": "📦", // Optionnel : Un émoji standard
+  "button_color": "success", // ENUM strict : "primary" (Bleu), "secondary" (Gris), "success" (Vert), "danger" (Rouge)
+  
+  // Logique métier (Où le ticket se crée et qui il notifie)
+  "active_category_id": 123456789012345, // ID Discord de la catégorie "Ouvert"
+  "archive_category_id": 98765432109876, // ID Discord de la catégorie "Fermé"
+  "ping_role_id": 456789123456789, // ID du rôle Staff à mentionner (Optionnel)
+  "intro_message": "Le staff arrive bientôt. Voici vos réponses :", // Message du bot dans le ticket ouvert
+  "inactivity_days": 3 // Nombre de jours avant auto-fermeture
 }
 ```
-*Toutes les routes retournent une erreur `403 Forbidden` si cet en-tête est manquant ou invalide.*
+
+### Objet `FormField` (La question dans la pop-up)
+Les questions qui s'affichent quand l'utilisateur clique sur le bouton.
+> **Règle absolue : L'interface web DOIT empêcher l'ajout de plus de 5 champs pour un même `panel_id`.**
+
+```json
+{
+  "id": 10,
+  "panel_id": 1,
+  "label": "Mode de livraison :", // Le texte de la question (Max 45 caractères)
+  "is_paragraph": false, // False = Input court, True = Textarea multiline
+  "required": true, // La réponse est-elle obligatoire ?
+  "order": 1 // Ordre d'affichage dans la modale (0, 1, 2, 3, 4)
+}
+```
+
+### Objet `Ticket` (L'historique et les datas utilisateur)
+Récupéré via l'API pour afficher un Dashboard des tickets gérés.
+
+```json
+{
+  "id": 142,
+  "panel_id": 1,
+  "channel_id": 888877776666,
+  "creator_id": 111122223333,
+  "status": "closed", // "open" ou "closed"
+  "form_answers": {
+    "Mode de livraison :": "Ship",
+    "Vos items :": "Carte Dracaufeu Edition 1"
+  },
+  "created_at": "2024-10-10T12:00:00Z",
+  "updated_at": "2024-10-10T12:30:00Z"
+}
+```
 
 ---
 
-## 🌐 2. Documentation Interactive (Swagger)
+## 📡 4. Endpoints Principaux (API Routes)
 
-FastAPI génère automatiquement une documentation interactive que ton développeur Front peut utiliser pour tester l'API en direct.
-Une fois l'application lancée, rends-toi sur : **`http://localhost:8000/docs`**
+### 🔌 Discord Data (Pour les menus déroulants du Front)
 
----
-
-## 📋 3. Endpoints (Routes API)
-
-L'URL de base pour toutes les requêtes est : `http://<IP_DU_SERVEUR>:8000/api`
-
-### 📊 Statistiques
-
-#### `GET /stats`
-Récupère les statistiques globales pour ton tableau de bord.
-* **Réponse attendue (200 OK)** :
-  ```json
+#### `GET /api/discord/channels`
+Récupère l'arborescence des serveurs et salons textes où le bot est installé.
+*   **Réponse** :
+```json
+[
   {
-    "total_tickets": 152,
-    "open_tickets": 12,
-    "closed_tickets": 140
+    "guild_id": "123456789",
+    "guild_name": "Mon Super Serveur",
+    "channels": [
+      {"id": "987654321", "name": "général"},
+      {"id": "112233445", "name": "support"}
+    ]
   }
-  ```
+]
+```
 
----
+### 🏷️ Panels CRUD (Configuration des boutons)
 
-### 🏷️ Gestion des Panels (Les boutons sur Discord)
+*   `GET /api/panels` : Retourne un tableau d'objets `Panel`.
+*   `POST /api/panels` : Crée un nouveau `Panel` (envoyer l'objet JSON sans l'ID).
+*   `PUT /api/panels/{panel_id}` : Met à jour un `Panel` spécifique.
+*   `DELETE /api/panels/{panel_id}` : Supprime un `Panel` et ses questions associées en cascade.
 
-Les "Panels" sont les configurations des boutons d'ouverture de tickets (ex: Panel "Support", Panel "Plainte").
+### 📝 FormFields CRUD (Configuration des questions)
 
-#### `GET /panels`
-Liste tous les panels configurés.
-* **Réponse attendue (200 OK)** :
-  ```json
-  [
-    {
-      "id": 1,
-      "name": "Support Technique",
-      "button_text": "Ouvrir un ticket",
-      "active_category_id": 123456789,
-      "archive_category_id": 987654321,
-      "ping_role_id": 456789123,
-      "intro_message": "Bonjour, décrivez votre problème :",
-      "inactivity_days": 3
-    }
-  ]
-  ```
+*   `GET /api/panels/{panel_id}/fields` : Retourne le tableau des questions pour un panel.
+*   `POST /api/panels/{panel_id}/fields` : Ajoute une question (Max 5).
+*   `PUT /api/fields/{field_id}` : Modifie une question.
+*   `DELETE /api/fields/{field_id}` : Supprime une question.
 
-#### `POST /panels`
-Créer une nouvelle configuration de panel.
-* **Payload JSON attendu** : (Le même format que le GET au-dessus, sans l'`id`).
-* **Réponse (200 OK)** : L'objet Panel créé avec son nouvel `id`.
+### 🚀 Déploiement sur Discord (L'Action)
 
-#### `PUT /panels/{panel_id}`
-Modifier un panel existant (changer le texte du bouton, la catégorie, etc.).
-* **Payload JSON attendu** : Champs à mettre à jour.
+#### `POST /api/panels/{panel_id}/send?channel_id={discord_channel_id}`
+*   **Description** : C'est le bouton "Déployer" de ton Frontend. Il indique au bot d'envoyer physiquement le message et le bouton dans le salon Discord sélectionné par l'utilisateur.
+*   **Paramètres** : `channel_id` est obligatoire en paramètre d'URL.
+*   **Réponse** : `{"success": true, "message": "Bouton envoyé dans le salon !"}`
 
-#### `DELETE /panels/{panel_id}`
-Supprimer un panel.
+### 🎫 Consultation et Archives (Pour le Dashboard)
 
-#### `POST /panels/{panel_id}/send?channel_id={discord_channel_id}` 🚀 **[ROUTE D'ACTION DISCORD]**
-Demande au Bot Discord de poster le bouton d'ouverture de ce panel dans le salon Discord ciblé. C'est comme ça que tu déploies le système depuis ton Frontend.
-* **Query Params** : `channel_id` (L'ID du salon textuel sur Discord).
-* **Réponse attendue (200 OK)** : `{"success": true, "message": "Bouton envoyé avec succès."}`
-
----
-
-### 📝 Gestion du Formulaire (Modale Discord)
-
-Ce sont les questions qui s'affichent quand l'utilisateur clique sur le bouton d'un Panel. *(Rappel : Discord limite à 5 questions maximum par formulaire).*
-
-#### `GET /panels/{panel_id}/fields`
-Récupérer les questions configurées pour un panel spécifique.
-* **Réponse attendue (200 OK)** :
-  ```json
-  [
-    {
-      "id": 1,
-      "panel_id": 1,
-      "label": "Quel est votre nom en jeu ?",
-      "is_paragraph": false,
-      "required": true,
-      "order": 1
-    },
-    {
-      "id": 2,
-      "panel_id": 1,
-      "label": "Décrivez le bug rencontré :",
-      "is_paragraph": true,
-      "required": true,
-      "order": 2
-    }
-  ]
-  ```
-
-#### `POST /panels/{panel_id}/fields`
-Ajouter une question au formulaire d'un panel.
-* **Payload JSON attendu** :
-  ```json
-  {
-    "label": "Votre question",
-    "is_paragraph": true,
-    "required": true,
-    "order": 3
-  }
-  ```
-
-#### `PUT /fields/{field_id}`
-Modifier une question existante.
-
-#### `DELETE /fields/{field_id}`
-Supprimer une question.
-
----
-
-### 🎫 Consultation des Tickets et Archives
-
-#### `GET /tickets`
-Lister les tickets. Idéal pour un tableau de bord des tickets en cours.
-* **Query Params (Optionnels)** : `status=open`, `panel_id=1`, `creator_id=123456789`
-* **Réponse attendue (200 OK)** :
-  ```json
-  [
-    {
-      "id": 42,
-      "panel_id": 1,
-      "channel_id": 1122334455,
-      "creator_id": 9988776655,
-      "status": "open",
-      "created_at": "2024-01-01T12:00:00",
-      "updated_at": "2024-01-01T12:05:00"
-    }
-  ]
-  ```
-
-#### `GET /tickets/{ticket_id}/archive`
-Récupérer le transcript d'un ticket fermé pour l'afficher visuellement sur le Frontend.
-* **Réponse attendue (200 OK)** :
-  ```json
-  {
-    "ticket_id": 42,
-    "html_content": "<!DOCTYPE html><html><body>...<div class=\"discord-messages\">...</body></html>"
-  }
-  ```
-*(Le Frontend pourra utiliser ce `html_content` dans une `<iframe>` ou l'injecter dynamiquement via un shadow DOM ou `dangerouslySetInnerHTML` pour afficher la conversation exactement comme sur Discord).*
+*   `GET /api/tickets` : Liste tous les tickets (Supporte des filtres via Query: `?status=open&panel_id=1`).
+*   `GET /api/tickets/{ticket_id}/archive` :
+    *   **Description** : Retourne l'historique visuel complet d'un ticket **fermé**.
+    *   **Réponse** : `{"ticket_id": 142, "html_content": "<!DOCTYPE html><html><body>...</body></html>"}`
+    *   **Usage Front** : Idéal à injecter dans une `<iframe>` ou via `dangerouslySetInnerHTML` en React pour re-créer une interface chat identique à Discord sur ton interface web.
