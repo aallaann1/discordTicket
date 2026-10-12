@@ -15,6 +15,7 @@ from sqlalchemy import func, text
 from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive
 from bot import bot, PanelView
 from schemas import PanelCreate, FieldCreate
+from migrator import auto_migrate_db
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -76,34 +77,8 @@ def ticket_to_dict(t: Ticket) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Migrations automatiques des colonnes pour PostgreSQL
-        migrations = [
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS active_category_id BIGINT",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS archive_category_id BIGINT",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS ping_role_id BIGINT",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS ping_creator BOOLEAN DEFAULT TRUE",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS max_tickets_per_user INT DEFAULT 1",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS deployed_channel_id BIGINT",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS deployed_message_id BIGINT",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS close_button_text VARCHAR DEFAULT 'Fermer le ticket'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS close_button_color VARCHAR DEFAULT 'danger'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS close_button_emoji VARCHAR DEFAULT '🔒'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS reopen_button_text VARCHAR DEFAULT 'Ré-ouvrir'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS reopen_button_color VARCHAR DEFAULT 'success'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS reopen_button_emoji VARCHAR DEFAULT '🔓'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS delete_button_text VARCHAR DEFAULT 'Supprimer'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS delete_button_color VARCHAR DEFAULT 'danger'",
-            "ALTER TABLE panels ADD COLUMN IF NOT EXISTS delete_button_emoji VARCHAR DEFAULT '🗑️'",
-            "ALTER TABLE tickets ALTER COLUMN channel_id DROP NOT NULL",
-            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS creator_username VARCHAR",
-        ]
-        for m in migrations:
-            try:
-                await conn.execute(text(m))
-            except Exception as e:
-                logger.info(f"Migration note ({m}): {e}")
+    # Synchronisation automatique et sécurisée du schéma de la BDD (aucune perte de données)
+    await auto_migrate_db(engine, Base)
     
     # Création d'un Panel par défaut (WTB) si aucun n'existe
     async with AsyncSessionLocal() as session:
