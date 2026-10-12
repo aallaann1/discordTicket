@@ -111,10 +111,12 @@ class FormModal(discord.ui.Modal):
 
         # 3. Création du ticket en BDD pour obtenir son ID unique incrémenté
         async with AsyncSessionLocal() as session:
+            user_pseudo = interaction.user.display_name or interaction.user.name
             ticket = Ticket(
                 panel_id=self.panel.id, 
                 channel_id=None, 
                 creator_id=interaction.user.id,
+                creator_username=user_pseudo,
                 form_answers=answers_dict,
                 status="open"
             )

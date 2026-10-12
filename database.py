@@ -70,6 +70,7 @@ class Ticket(Base):
     panel_id = Column(Integer, ForeignKey('panels.id'))
     channel_id = Column(BigInteger, unique=True, index=True, nullable=True)
     creator_id = Column(BigInteger)
+    creator_username = Column(String, nullable=True)
     status = Column(String, default="open") # open, closed
     
     # 🆕 Sauvegarde des réponses du formulaire en base de données JSON

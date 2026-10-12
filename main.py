@@ -1,7 +1,8 @@
 import asyncio
 import os
 import logging
-from fastapi import FastAPI, Depends, HTTPException, Security, Request
+from typing import Optional
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, Query
 from fastapi.security.api_key import APIKeyHeader
 from contextlib import asynccontextmanager
 import uvicorn
@@ -66,6 +67,7 @@ def ticket_to_dict(t: Ticket) -> dict:
         "panel_id": t.panel_id,
         "channel_id": str(t.channel_id) if t.channel_id else None,
         "creator_id": str(t.creator_id) if t.creator_id else None,
+        "creator_username": getattr(t, "creator_username", None),
         "status": t.status,
         "form_answers": t.form_answers,
         "created_at": t.created_at.isoformat() if t.created_at else None,
@@ -95,6 +97,7 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE panels ADD COLUMN IF NOT EXISTS delete_button_color VARCHAR DEFAULT 'danger'",
             "ALTER TABLE panels ADD COLUMN IF NOT EXISTS delete_button_emoji VARCHAR DEFAULT '🗑️'",
             "ALTER TABLE tickets ALTER COLUMN channel_id DROP NOT NULL",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS creator_username VARCHAR",
         ]
         for m in migrations:
             try:
@@ -322,10 +325,36 @@ async def get_stats():
         }
 
 @app.get("/api/tickets", dependencies=[Depends(get_api_key)])
-async def get_tickets():
+async def get_tickets(limit: Optional[int] = Query(None), offset: int = 0):
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Ticket).order_by(Ticket.created_at.desc()))
-        return [ticket_to_dict(t) for t in res.scalars().all()]
+        query = select(Ticket).order_by(Ticket.created_at.desc())
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        res = await session.execute(query)
+        tickets = res.scalars().all()
+        result = []
+        updated = False
+        for t in tickets:
+            td = ticket_to_dict(t)
+            if not td.get("creator_username") and t.creator_id:
+                user = bot.get_user(t.creator_id)
+                if not user:
+                    try:
+                        user = await bot.fetch_user(t.creator_id)
+                    except Exception:
+                        user = None
+                if user:
+                    u_name = user.display_name if user.display_name else user.name
+                    td["creator_username"] = u_name
+                    t.creator_username = u_name
+                    updated = True
+            result.append(td)
+        if updated:
+            try:
+                await session.commit()
+            except Exception:
+                pass
+        return result
 
 @app.post("/api/tickets/{ticket_id}/close", dependencies=[Depends(get_api_key)])
 async def close_ticket(ticket_id: int):
