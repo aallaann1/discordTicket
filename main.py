@@ -221,6 +221,14 @@ async def delete_panel(panel_id: int):
     async with AsyncSessionLocal() as session:
         panel = await session.get(Panel, panel_id)
         if panel:
+            # Supprime aussi le message déployé sur Discord pour ne pas laisser de bouton orphelin
+            if panel.deployed_channel_id and panel.deployed_message_id:
+                try:
+                    ch = bot.get_channel(panel.deployed_channel_id) or await bot.fetch_channel(panel.deployed_channel_id)
+                    msg = await ch.fetch_message(panel.deployed_message_id)
+                    await msg.delete()
+                except Exception as e:
+                    logger.warning(f"Impossible de supprimer le message déployé du panel {panel_id}: {e}")
             await session.delete(panel)
             await session.commit()
         return {"success": True}
@@ -347,6 +355,17 @@ async def close_ticket(ticket_id: int):
             except Exception:
                 pass
 
+        # Fallback : si non trouvé par ID, chercher le salon par son nom incrémenté (ex: ticket006)
+        if not channel:
+            target_name = f"ticket{ticket.id:03d}"
+            for guild in bot.guilds:
+                ch = discord.utils.get(guild.text_channels, name=target_name)
+                if ch:
+                    channel = ch
+                    ticket.channel_id = ch.id
+                    logger.info(f"Salon retrouvé par nom '{target_name}' : ID {ch.id}")
+                    break
+
         transcript = ""
         if channel:
             try:
@@ -375,7 +394,14 @@ async def close_ticket(ticket_id: int):
         await session.commit()
 
         if channel:
-            # Retirer l'accès au membre créateur
+            # 1. Retirer TOUS les boutons 'Fermer' des messages précédents du salon
+            try:
+                from bot import remove_close_buttons_from_channel
+                await remove_close_buttons_from_channel(channel)
+            except Exception as e:
+                logger.warning(f"Erreur lors du nettoyage des boutons 'Fermer' : {e}")
+
+            # 2. Retirer l'accès au membre créateur
             try:
                 member = channel.guild.get_member(ticket.creator_id)
                 if not member:
@@ -385,7 +411,7 @@ async def close_ticket(ticket_id: int):
             except Exception:
                 pass
 
-            # Déplacer vers la catégorie archive si configurée
+            # 3. Déplacer vers la catégorie archive si configurée
             if panel and panel.archive_category_id:
                 try:
                     arch_id = int(str(panel.archive_category_id).strip())
@@ -397,7 +423,7 @@ async def close_ticket(ticket_id: int):
                 except Exception as e:
                     logger.warning(f"Erreur déplacement archive: {e}")
 
-            # Envoyer le message d'archive avec boutons Ré-ouvrir et Supprimer
+            # 4. Envoyer le message d'archive avec boutons Ré-ouvrir et Supprimer
             try:
                 import io
                 from bot import ArchivedTicketView

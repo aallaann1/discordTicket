@@ -5,11 +5,122 @@ import io
 import datetime
 import logging
 import asyncio
+import os
+import socket
+import re
+from typing import Optional
 from sqlalchemy.future import select
 from sqlalchemy import func
 from database import AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive
 
 logger = logging.getLogger(__name__)
+
+# Identifiant de l'instance (nom d'hôte / conteneur) pour détecter plusieurs bots lancés avec le même token
+INSTANCE_ID = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
+
+async def find_ticket_for_channel(session, channel: discord.abc.GuildChannel) -> Optional[Ticket]:
+    """Retrouve le ticket associé à un salon par channel.id, avec fallback par nom de salon (ticket006 -> ID 6)."""
+    if not channel:
+        return None
+
+    # 1. Recherche directe par channel_id
+    res = await session.execute(select(Ticket).where(Ticket.channel_id == channel.id))
+    ticket = res.scalar_one_or_none()
+    if ticket:
+        return ticket
+
+    # 2. Fallback par nom de salon : ticket006, ticket6, etc.
+    channel_name = getattr(channel, "name", "") or ""
+    match = re.search(r"ticket[-_]?(\d+)", channel_name, re.IGNORECASE)
+    if match:
+        try:
+            t_id = int(match.group(1))
+            ticket = await session.get(Ticket, t_id)
+            if ticket:
+                logger.info(
+                    f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via nom de salon '{channel_name}' "
+                    f"(channel_id resynchronisé de {ticket.channel_id} vers {channel.id})"
+                )
+                ticket.channel_id = channel.id
+                await session.commit()
+                return ticket
+        except Exception as e:
+            logger.warning(f"[{INSTANCE_ID}] Erreur fallback nom de salon '{channel_name}': {e}")
+
+    # 3. Fallback par recherche dans l'historique du salon (footer embed ou fichier transcript)
+    try:
+        async for msg in channel.history(limit=20):
+            for emb in msg.embeds:
+                footer_text = emb.footer.text if emb.footer else ""
+                match_footer = re.search(r"ticket[-_]?(\d+)", footer_text or "", re.IGNORECASE)
+                if match_footer:
+                    t_id = int(match_footer.group(1))
+                    ticket = await session.get(Ticket, t_id)
+                    if ticket:
+                        logger.info(f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via footer embed '{footer_text}'")
+                        ticket.channel_id = channel.id
+                        await session.commit()
+                        return ticket
+            for att in msg.attachments:
+                match_att = re.search(r"transcript[-_]?(\d+)", att.filename or "", re.IGNORECASE)
+                if match_att:
+                    t_id = int(match_att.group(1))
+                    ticket = await session.get(Ticket, t_id)
+                    if ticket:
+                        logger.info(f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via fichier '{att.filename}'")
+                        ticket.channel_id = channel.id
+                        await session.commit()
+                        return ticket
+    except Exception as e:
+        logger.warning(f"[{INSTANCE_ID}] Erreur fallback historique salon: {e}")
+
+    return None
+
+async def remove_close_buttons_from_channel(channel: discord.TextChannel):
+    """Retire le bouton de fermeture de tous les messages du bot dans ce salon."""
+    if not channel:
+        return
+    try:
+        async for msg in channel.history(limit=30):
+            if bot.user and msg.author.id == bot.user.id and msg.components:
+                has_close = False
+                for row in msg.components:
+                    for comp in getattr(row, "children", []):
+                        if getattr(comp, "custom_id", None) == "close_ticket":
+                            has_close = True
+                            break
+                    if has_close:
+                        break
+                if has_close:
+                    try:
+                        await msg.edit(view=None)
+                    except Exception as e:
+                        logger.warning(f"Impossible d'éditer le message {msg.id} pour retirer le bouton close: {e}")
+    except Exception as e:
+        logger.warning(f"Erreur nettoyage boutons fermer dans channel {channel.id}: {e}")
+
+async def remove_archive_buttons_from_channel(channel: discord.TextChannel):
+    """Retire les boutons 'Ré-ouvrir' et 'Supprimer' de tous les messages d'archive du bot dans ce salon."""
+    if not channel:
+        return
+    try:
+        async for msg in channel.history(limit=30):
+            if bot.user and msg.author.id == bot.user.id and msg.components:
+                has_archive = False
+                for row in msg.components:
+                    for comp in getattr(row, "children", []):
+                        if getattr(comp, "custom_id", None) in ["reopen_ticket", "delete_ticket"]:
+                            has_archive = True
+                            break
+                    if has_archive:
+                        break
+                if has_archive:
+                    try:
+                        await msg.edit(view=None)
+                    except Exception as e:
+                        logger.warning(f"Impossible d'éditer le message archive {msg.id}: {e}")
+    except Exception as e:
+        logger.warning(f"Erreur nettoyage boutons archive dans channel {channel.id}: {e}")
 
 def get_button_style(color_str: str) -> discord.ButtonStyle:
     styles = {
@@ -189,9 +300,9 @@ class TicketView(discord.ui.View):
         channel = interaction.channel
         
         async with AsyncSessionLocal() as session:
-            result = await session.execute(select(Ticket).where(Ticket.channel_id == channel.id))
-            ticket = result.scalar_one_or_none()
+            ticket = await find_ticket_for_channel(session, channel)
             if not ticket:
+                logger.warning(f"[{INSTANCE_ID}] close_ticket: aucun ticket trouvé pour le salon #{channel.name} ({channel.id})")
                 return await interaction.followup.send("❌ Ticket introuvable.", ephemeral=True)
             
             panel = await session.get(Panel, ticket.panel_id)
@@ -205,6 +316,11 @@ class TicketView(discord.ui.View):
                     ephemeral=True
                 )
             
+            # Si le ticket est déjà fermé : nettoyer les boutons et informer
+            if ticket.status == "closed":
+                await remove_close_buttons_from_channel(channel)
+                return await interaction.followup.send("ℹ️ Ce ticket est déjà fermé.", ephemeral=True)
+
             transcript = await chat_exporter.export(
                 channel,
                 limit=None,
@@ -248,11 +364,8 @@ class TicketView(discord.ui.View):
                 except Exception as e:
                     logger.warning(f"Erreur déplacement archive: {e}")
 
-            # 1. Enlever le bouton close du message actuel
-            try:
-                await interaction.message.edit(view=None)
-            except Exception as e:
-                logger.warning(f"Impossible d'éditer le message original: {e}")
+            # 1. Enlever TOUS les boutons 'Fermer' du salon (message initial et éventuels messages de réouverture)
+            await remove_close_buttons_from_channel(channel)
 
             # 2. Envoyer l'archive avec la vue contenant UNIQUEMENT Ré-ouvrir et Supprimer
             file = discord.File(io.BytesIO(transcript.encode()), filename=f"transcript-{ticket.id}.html")
@@ -297,10 +410,10 @@ class ArchivedTicketView(discord.ui.View):
         await interaction.response.defer()
         channel = interaction.channel
         async with AsyncSessionLocal() as session:
-            res = await session.execute(select(Ticket).where(Ticket.channel_id == channel.id))
-            ticket = res.scalar_one_or_none()
+            ticket = await find_ticket_for_channel(session, channel)
             
             if not ticket:
+                logger.warning(f"[{INSTANCE_ID}] reopen_ticket: aucun ticket trouvé pour le salon #{channel.name} ({channel.id})")
                 return await interaction.followup.send("❌ Ticket introuvable.", ephemeral=True)
 
             panel = await session.get(Panel, ticket.panel_id)
@@ -343,11 +456,8 @@ class ArchivedTicketView(discord.ui.View):
                 except Exception as e:
                     logger.warning(f"Erreur déplacement catégorie active: {e}")
 
-        # Enlever les boutons Ré-ouvrir et Supprimer du message
-        try:
-            await interaction.message.edit(view=None)
-        except Exception as e:
-            logger.warning(f"Impossible d'éditer le message archivé: {e}")
+        # Enlever TOUS les boutons d'archive du salon
+        await remove_archive_buttons_from_channel(channel)
 
         # Envoyer le message de réouverture avec SEULEMENT le bouton Fermer
         await channel.send(f"🔓 Ticket réouvert par {interaction.user.mention}", view=TicketView(panel))
@@ -358,8 +468,7 @@ class ArchivedTicketView(discord.ui.View):
 
         # SÉCURITÉ : Seuls les membres du staff peuvent supprimer définitivement
         async with AsyncSessionLocal() as session:
-            res = await session.execute(select(Ticket).where(Ticket.channel_id == channel.id))
-            ticket = res.scalar_one_or_none()
+            ticket = await find_ticket_for_channel(session, channel)
             panel = await session.get(Panel, ticket.panel_id) if ticket else None
 
         if not is_staff(interaction.user, panel):
@@ -390,41 +499,82 @@ class TicketingBot(commands.Bot):
         self.add_view(TicketView())
         self.add_view(ArchivedTicketView())
 
+    async def on_ready(self):
+        logger.info(
+            f"✅ Bot connecté en tant que {self.user} (instance '{INSTANCE_ID}', "
+            f"{len(self.guilds)} serveur(s)). ⚠️ Une seule instance doit utiliser ce token."
+        )
+
 bot = TicketingBot()
 
 @bot.listen("on_interaction")
 async def on_interaction(interaction: discord.Interaction):
-    if interaction.type == discord.InteractionType.component:
-        custom_id = interaction.data.get('custom_id', '')
-        if custom_id.startswith("panel_"):
-            panel_id = int(custom_id.split("_")[1])
-            async with AsyncSessionLocal() as session:
-                panel = await session.get(Panel, panel_id)
-                if not panel:
-                    return await interaction.response.send_message("❌ Panneau introuvable.", ephemeral=True)
-                
-                # Vérification du nombre maximal de tickets ouverts par utilisateur
-                max_tickets = getattr(panel, "max_tickets_per_user", 1) or 1
-                if max_tickets > 0:
-                    res_open = await session.execute(
-                        select(func.count(Ticket.id)).where(
-                            Ticket.panel_id == panel_id,
-                            Ticket.creator_id == interaction.user.id,
-                            Ticket.status == "open"
-                        )
-                    )
-                    open_count = res_open.scalar() or 0
-                    if open_count >= max_tickets:
-                        return await interaction.response.send_message(
-                            f"❌ Vous avez déjà {open_count} ticket(s) ouvert(s) pour ce panel (maximum autorisé : {max_tickets}).",
-                            ephemeral=True
-                        )
+    if interaction.type != discord.InteractionType.component:
+        return
+    custom_id = interaction.data.get('custom_id', '')
+    if not custom_id.startswith("panel_"):
+        return
 
-                res = await session.execute(select(FormField).where(FormField.panel_id == panel_id))
-                fields = res.scalars().all()
-                
-                if not fields:
-                    return await interaction.response.send_message("❌ Aucune question configurée pour ce panneau.", ephemeral=True)
-                
-                await interaction.response.send_modal(FormModal(panel, fields))
+    try:
+        panel_id = int(custom_id.split("_")[1])
+    except (IndexError, ValueError):
+        return
+
+    logger.info(f"[{INSTANCE_ID}] Clic sur panel_{panel_id} par {interaction.user} ({interaction.user.id})")
+
+    try:
+        async with AsyncSessionLocal() as session:
+            panel = await session.get(Panel, panel_id)
+            if not panel:
+                logger.warning(
+                    f"[{INSTANCE_ID}] panel_{panel_id} absent de la base de cette instance. "
+                    f"Si le clic fonctionne parfois, une AUTRE instance du bot tourne avec le même token."
+                )
+                # On laisse une chance à une éventuelle autre instance (qui possède ce panel) de répondre
+                # en premier : si elle l'a fait, Discord refusera notre réponse et on l'ignore silencieusement.
+                await asyncio.sleep(2)
+                try:
+                    await interaction.response.send_message(
+                        f"❌ Ce panneau n'existe plus (ID {panel_id}). Il a probablement été supprimé : "
+                        f"redéployez un panel à jour depuis le site.",
+                        ephemeral=True
+                    )
+                except (discord.InteractionResponded, discord.HTTPException):
+                    pass
+                return
+
+            # Vérification du nombre maximal de tickets ouverts par utilisateur
+            max_tickets = getattr(panel, "max_tickets_per_user", 1) or 1
+            if max_tickets > 0:
+                res_open = await session.execute(
+                    select(func.count(Ticket.id)).where(
+                        Ticket.panel_id == panel_id,
+                        Ticket.creator_id == interaction.user.id,
+                        Ticket.status == "open"
+                    )
+                )
+                open_count = res_open.scalar() or 0
+                if open_count >= max_tickets:
+                    return await interaction.response.send_message(
+                        f"❌ Vous avez déjà {open_count} ticket(s) ouvert(s) pour ce panel (maximum autorisé : {max_tickets}).",
+                        ephemeral=True
+                    )
+
+            res = await session.execute(select(FormField).where(FormField.panel_id == panel_id))
+            fields = res.scalars().all()
+
+        if not fields:
+            return await interaction.response.send_message("❌ Aucune question configurée pour ce panneau.", ephemeral=True)
+
+        await interaction.response.send_modal(FormModal(panel, fields))
+    except (discord.InteractionResponded, discord.NotFound) as e:
+        # Interaction déjà traitée (autre instance) ou expirée (> 3 s)
+        logger.warning(f"[{INSTANCE_ID}] Interaction panel_{panel_id} non traitée : {e}")
+    except Exception as e:
+        logger.exception(f"[{INSTANCE_ID}] Erreur lors du clic sur panel_{panel_id}: {e}")
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Une erreur est survenue, veuillez réessayer.", ephemeral=True)
+        except Exception:
+            pass
 
