@@ -36,3 +36,7 @@ class FieldCreate(BaseModel):
     required: bool = True
     order: int = 0
 
+class BotProfileUpdate(BaseModel):
+    username: Optional[str] = None
+    avatar_base64: Optional[str] = None
+

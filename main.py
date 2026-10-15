@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import base64
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Security, Request, Query
 from fastapi.security.api_key import APIKeyHeader
@@ -14,7 +15,7 @@ from sqlalchemy import func, text
 
 from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive
 from bot import bot, PanelView
-from schemas import PanelCreate, FieldCreate
+from schemas import PanelCreate, FieldCreate, BotProfileUpdate
 from migrator import auto_migrate_db
 
 load_dotenv()
@@ -121,6 +122,75 @@ async def get_discord_channels():
             "roles": roles
         })
     return data
+
+# --- PROFIL DU BOT DISCORD (NOM ET AVATAR) ---
+@app.get("/api/bot/profile", dependencies=[Depends(get_api_key)])
+async def get_bot_profile():
+    """Récupère le nom et l'avatar actuels du bot Discord."""
+    if not bot.is_ready() or not bot.user:
+        raise HTTPException(status_code=503, detail="Le bot Discord n'est pas encore prêt ou connecté.")
+    
+    avatar_url = str(bot.user.display_avatar.url) if bot.user.display_avatar else None
+    return {
+        "id": str(bot.user.id),
+        "username": bot.user.name,
+        "avatar_url": avatar_url
+    }
+
+@app.post("/api/bot/profile", dependencies=[Depends(get_api_key)])
+async def update_bot_profile(profile_data: BotProfileUpdate):
+    """Met à jour le nom et/ou l'avatar du bot Discord."""
+    if not bot.is_ready() or not bot.user:
+        raise HTTPException(status_code=503, detail="Le bot Discord n'est pas encore prêt ou connecté.")
+
+    edit_kwargs = {}
+    
+    # Mise à jour du nom d'utilisateur
+    if profile_data.username and profile_data.username.strip():
+        new_username = profile_data.username.strip()
+        if new_username != bot.user.name:
+            edit_kwargs["username"] = new_username
+
+    # Mise à jour de l'avatar
+    if profile_data.avatar_base64:
+        try:
+            b64_str = profile_data.avatar_base64
+            if "," in b64_str:
+                b64_str = b64_str.split(",", 1)[1]
+            edit_kwargs["avatar"] = base64.b64decode(b64_str)
+        except Exception as e:
+            logger.error(f"Erreur décodage base64 avatar: {e}")
+            raise HTTPException(status_code=400, detail="Format d'image base64 invalide.")
+
+    if not edit_kwargs:
+        return {
+            "id": str(bot.user.id),
+            "username": bot.user.name,
+            "avatar_url": str(bot.user.display_avatar.url) if bot.user.display_avatar else None,
+            "message": "Aucune modification demandée."
+        }
+
+    try:
+        await bot.user.edit(**edit_kwargs)
+        logger.info(f"Profil du bot Discord mis à jour: {list(edit_kwargs.keys())}")
+        return {
+            "id": str(bot.user.id),
+            "username": bot.user.name,
+            "avatar_url": str(bot.user.display_avatar.url) if bot.user.display_avatar else None,
+            "message": "Profil du bot mis à jour avec succès !"
+        }
+    except discord.HTTPException as exc:
+        logger.error(f"Erreur Discord API lors de l'édition du profil: {exc}")
+        if exc.status == 429:
+            raise HTTPException(
+                status_code=429, 
+                detail="Discord limite le changement de nom ou d'avatar (max 2 changements de nom par heure). Veuillez patienter avant de réessayer."
+            )
+        error_msg = exc.text if hasattr(exc, "text") and exc.text else str(exc)
+        raise HTTPException(status_code=exc.status or 400, detail=f"Erreur Discord : {error_msg}")
+    except Exception as exc:
+        logger.error(f"Erreur inattendue lors de l'édition du profil: {exc}")
+        raise HTTPException(status_code=500, detail=f"Erreur serveur : {str(exc)}")
 
 @app.get("/api/panels", dependencies=[Depends(get_api_key)])
 async def get_panels():
