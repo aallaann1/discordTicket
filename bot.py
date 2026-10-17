@@ -29,16 +29,32 @@ async def find_ticket_for_channel(session, channel: discord.abc.GuildChannel) ->
     if ticket:
         return ticket
 
-    # 2. Fallback par nom de salon : ticket006, ticket6, etc.
     channel_name = getattr(channel, "name", "") or ""
-    match = re.search(r"ticket[-_]?(\d+)", channel_name, re.IGNORECASE)
+
+    # 2. Fallback par nom de salon exact (ticket_name, ex: alan-001)
+    if channel_name:
+        res_name = await session.execute(
+            select(Ticket).where(Ticket.ticket_name == channel_name).order_by(Ticket.id.desc())
+        )
+        ticket = res_name.scalars().first()
+        if ticket:
+            logger.info(
+                f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} ({ticket.ticket_name}) retrouvé via nom de salon '{channel_name}' "
+                f"(channel_id resynchronisé de {ticket.channel_id} vers {channel.id})"
+            )
+            ticket.channel_id = channel.id
+            await session.commit()
+            return ticket
+
+    # 3. Fallback pour anciens tickets nommés ticket006, ticket6, etc.
+    match = re.search(r"^ticket[-_]?(\d+)$", channel_name, re.IGNORECASE)
     if match:
         try:
             t_id = int(match.group(1))
             ticket = await session.get(Ticket, t_id)
             if ticket:
                 logger.info(
-                    f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via nom de salon '{channel_name}' "
+                    f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via ancien nom de salon '{channel_name}' "
                     f"(channel_id resynchronisé de {ticket.channel_id} vers {channel.id})"
                 )
                 ticket.channel_id = channel.id
@@ -47,11 +63,20 @@ async def find_ticket_for_channel(session, channel: discord.abc.GuildChannel) ->
         except Exception as e:
             logger.warning(f"[{INSTANCE_ID}] Erreur fallback nom de salon '{channel_name}': {e}")
 
-    # 3. Fallback par recherche dans l'historique du salon (footer embed ou fichier transcript)
+    # 4. Fallback par recherche dans l'historique du salon (footer embed ou fichier transcript)
     try:
         async for msg in channel.history(limit=20):
             for emb in msg.embeds:
                 footer_text = emb.footer.text if emb.footer else ""
+                match_id = re.search(r"ID:\s*(\d+)", footer_text or "", re.IGNORECASE)
+                if match_id:
+                    t_id = int(match_id.group(1))
+                    ticket = await session.get(Ticket, t_id)
+                    if ticket:
+                        logger.info(f"[{INSTANCE_ID}] Fallback réussi : Ticket #{ticket.id} retrouvé via footer embed ID '{footer_text}'")
+                        ticket.channel_id = channel.id
+                        await session.commit()
+                        return ticket
                 match_footer = re.search(r"ticket[-_]?(\d+)", footer_text or "", re.IGNORECASE)
                 if match_footer:
                     t_id = int(match_footer.group(1))
@@ -77,7 +102,7 @@ async def find_ticket_for_channel(session, channel: discord.abc.GuildChannel) ->
     return None
 
 async def remove_close_buttons_from_channel(channel: discord.TextChannel):
-    """Retire le bouton de fermeture de tous les messages du bot dans ce salon."""
+    """Retire les boutons de fermeture ('Fermer' et 'Fermer avec raison') de tous les messages du bot dans ce salon."""
     if not channel:
         return
     try:
@@ -86,7 +111,7 @@ async def remove_close_buttons_from_channel(channel: discord.TextChannel):
                 has_close = False
                 for row in msg.components:
                     for comp in getattr(row, "children", []):
-                        if getattr(comp, "custom_id", None) == "close_ticket":
+                        if getattr(comp, "custom_id", None) in ("close_ticket", "close_ticket_reason"):
                             has_close = True
                             break
                     if has_close:
@@ -159,124 +184,596 @@ class PanelView(discord.ui.View):
         )
         self.add_item(button)
 
+
+def parse_discord_emoji(emoji_str: str) -> Optional[dict]:
+    """Convertit un emoji Unicode ou custom (<:nom:id>) au format dict attendu par l'API Discord."""
+    if not emoji_str or not str(emoji_str).strip():
+        return None
+    raw = str(emoji_str).strip()
+    custom_match = re.match(r"^<(a?):([a-zA-Z0-9_]+):(\d+)>$", raw)
+    if custom_match:
+        return {
+            "animated": bool(custom_match.group(1)),
+            "name": custom_match.group(2),
+            "id": custom_match.group(3),
+        }
+    return {"name": raw}
+
+
+def get_effective_field_type(f: FormField) -> str:
+    raw_type = getattr(f, "field_type", None)
+    if not raw_type:
+        return "paragraph" if getattr(f, "is_paragraph", False) else "short_text"
+    if raw_type == "short_text" and getattr(f, "is_paragraph", False):
+        return "paragraph"
+    return raw_type
+
+
+def build_modal_payload(panel: Panel, fields: list) -> dict:
+    """
+    Construit le payload JSON d'une modale Discord utilisant les composants Label (type 18),
+    permettant d'intégrer des listes déroulantes (type 3, 5, 6, 8), des descriptions sous les champs,
+    des placeholders, valeurs par défaut et limites de caractères.
+    """
+    modal_title = (getattr(panel, "modal_title", None) or panel.name or "Formulaire").strip()[:45]
+    sorted_fields = sorted(fields, key=lambda x: (x.order if x.order is not None else 0, x.id))[:5]
+    components = []
+
+    for f in sorted_fields:
+        ftype = get_effective_field_type(f)
+        is_req = bool(f.required) if f.required is not None else True
+        cid = f"field_{f.id}"
+
+        if ftype == "select":
+            raw_options = getattr(f, "options", None) or []
+            select_options = []
+            seen_values = set()
+            for opt in raw_options[:25]:
+                if isinstance(opt, str):
+                    opt = {"label": opt, "value": opt}
+                if not isinstance(opt, dict):
+                    continue
+                lbl = str(opt.get("label") or "").strip()[:100]
+                if not lbl:
+                    continue
+                val = str(opt.get("value") or lbl).strip()[:100]
+                base_val = val
+                idx_dup = 2
+                while val in seen_values:
+                    suffix = f" ({idx_dup})"
+                    val = f"{base_val[:100 - len(suffix)]}{suffix}"
+                    idx_dup += 1
+                seen_values.add(val)
+
+                opt_dict = {
+                    "label": lbl,
+                    "value": val,
+                }
+                desc = str(opt.get("description") or "").strip()[:100]
+                if desc:
+                    opt_dict["description"] = desc
+                emoji_obj = parse_discord_emoji(opt.get("emoji"))
+                if emoji_obj:
+                    opt_dict["emoji"] = emoji_obj
+                if opt.get("default"):
+                    opt_dict["default"] = True
+                select_options.append(opt_dict)
+
+            if not select_options:
+                select_options = [{"label": "Option par défaut", "value": "Option par défaut"}]
+
+            num_opts = len(select_options)
+            max_v = getattr(f, "max_values", 1) or 1
+            max_v = max(1, min(int(max_v), num_opts))
+            min_v = getattr(f, "min_values", 1) if getattr(f, "min_values", None) is not None else (1 if is_req else 0)
+            min_v = max(0 if not is_req else 1, min(int(min_v), max_v))
+
+            inner_comp = {
+                "type": 3,  # STRING_SELECT
+                "custom_id": cid,
+                "options": select_options,
+                "min_values": min_v,
+                "max_values": max_v,
+                "required": is_req,
+            }
+            placeholder = str(getattr(f, "placeholder", None) or "Fais un choix").strip()[:150]
+            if placeholder:
+                inner_comp["placeholder"] = placeholder
+
+        elif ftype in ("user_select", "role_select", "channel_select"):
+            comp_type_map = {
+                "user_select": 5,
+                "role_select": 6,
+                "channel_select": 8,
+            }
+            max_v = max(1, min(int(getattr(f, "max_values", 1) or 1), 25))
+            min_v = getattr(f, "min_values", 1) if getattr(f, "min_values", None) is not None else (1 if is_req else 0)
+            min_v = max(0 if not is_req else 1, min(int(min_v), max_v))
+
+            inner_comp = {
+                "type": comp_type_map[ftype],
+                "custom_id": cid,
+                "min_values": min_v,
+                "max_values": max_v,
+                "required": is_req,
+            }
+            placeholder = str(getattr(f, "placeholder", None) or "Fais un choix").strip()[:150]
+            if placeholder:
+                inner_comp["placeholder"] = placeholder
+
+        elif ftype == "file_upload":
+            # Component Type 19 : FILE_UPLOAD (1 à 10 fichiers/photos dans la modale)
+            max_v = max(1, min(int(getattr(f, "max_values", 5) or 5), 10))
+            raw_min = getattr(f, "min_values", None)
+            if not is_req:
+                min_v = 0
+            else:
+                min_v = max(1, min(int(raw_min if raw_min is not None else 1), max_v))
+
+            inner_comp = {
+                "type": 19,  # FILE_UPLOAD
+                "custom_id": cid,
+                "min_values": min_v,
+                "max_values": max_v,
+                "required": is_req,
+            }
+
+        else:
+            # short_text ou paragraph -> TEXT_INPUT (type 4)
+            inner_comp = {
+                "type": 4,
+                "custom_id": cid,
+                "style": 2 if ftype == "paragraph" else 1,
+                "required": is_req,
+            }
+            placeholder = str(getattr(f, "placeholder", None) or "").strip()[:100]
+            if placeholder:
+                inner_comp["placeholder"] = placeholder
+
+            default_val = str(getattr(f, "default_value", None) or "").strip()[:4000]
+            if default_val:
+                inner_comp["value"] = default_val
+
+            min_len = getattr(f, "min_length", None)
+            if min_len is not None and str(min_len).strip() != "":
+                try:
+                    ml = int(min_len)
+                    if 0 <= ml <= 4000:
+                        inner_comp["min_length"] = ml
+                except (ValueError, TypeError):
+                    pass
+
+            max_len = getattr(f, "max_length", None)
+            if max_len is not None and str(max_len).strip() != "":
+                try:
+                    mxl = int(max_len)
+                    if 1 <= mxl <= 4000:
+                        inner_comp["max_length"] = mxl
+                except (ValueError, TypeError):
+                    pass
+
+        label_wrapper = {
+            "type": 18,  # ComponentType.LABEL
+            "label": (f.label or "Question").strip()[:45],
+            "component": inner_comp,
+        }
+        desc_text = str(getattr(f, "description", None) or "").strip()[:100]
+        if desc_text:
+            label_wrapper["description"] = desc_text
+
+        components.append(label_wrapper)
+
+    return {
+        "custom_id": f"ticket_modal_{panel.id}",
+        "title": modal_title or "Formulaire",
+        "components": components,
+    }
+
+
+async def send_custom_modal(interaction: discord.Interaction, panel: Panel, fields: list):
+    """Envoie la modale enrichie (Label type 18 + listes déroulantes / champs texte / upload) via l'API HTTP Discord."""
+    from discord.http import Route
+
+    modal_data = build_modal_payload(panel, fields)
+    route = Route(
+        "POST",
+        "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id,
+        interaction_token=interaction.token,
+    )
+    await interaction._state.http.request(route, json={"type": 9, "data": modal_data})
+    interaction.response._responded = True
+
+
+async def process_ticket_creation(
+    interaction: discord.Interaction,
+    panel: Panel,
+    answers_dict: dict,
+    uploaded_attachments: Optional[list] = None,
+):
+    """Crée le salon de ticket, enregistre le ticket en BDD et envoie l'embed récapitulatif (+ fichiers uploadés)."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # 1. Résolution de la catégorie active
+    category = None
+    if panel.active_category_id:
+        try:
+            cat_id = int(str(panel.active_category_id).strip())
+            if cat_id > 0:
+                category = guild.get_channel(cat_id) or discord.utils.get(guild.categories, id=cat_id)
+                if not category:
+                    try:
+                        category = await interaction.client.fetch_channel(cat_id)
+                    except Exception as e:
+                        logger.warning(f"Impossible de fetch la catégorie {cat_id}: {e}")
+        except Exception as e:
+            logger.error(f"Erreur avec active_category_id: {e}")
+
+    # Permissions : Héritage des permissions de la catégorie (pour que le Staff y ait accès quoi qu'il arrive)
+    overwrites = {}
+    if category and category.overwrites:
+        for target, ow in category.overwrites.items():
+            overwrites[target] = ow
+
+    # @everyone n'a JAMAIS accès au ticket
+    overwrites[guild.default_role] = discord.PermissionOverwrite(read_messages=False)
+    # Seul le membre créateur a accès
+    overwrites[interaction.user] = discord.PermissionOverwrite(
+        read_messages=True, send_messages=True, attach_files=True, embed_links=True
+    )
+    # Le bot conserve les droits complets
+    overwrites[guild.me] = discord.PermissionOverwrite(
+        read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True
+    )
+
+    # Si un rôle staff est configuré sur le panel, on lui garantit explicitement l'accès
+    if panel.ping_role_id:
+        try:
+            r_id = int(str(panel.ping_role_id).strip())
+            role = guild.get_role(r_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True, attach_files=True, embed_links=True
+                )
+        except Exception:
+            pass
+
+    # 2. Création du ticket en BDD pour obtenir son nom incrémenté par utilisateur (<pseudo>-001, 002, ...)
+    async with AsyncSessionLocal() as session:
+        count_res = await session.execute(
+            select(func.count(Ticket.id)).where(Ticket.creator_id == interaction.user.id)
+        )
+        total_user_tickets = count_res.scalar() or 0
+        user_ticket_number = total_user_tickets + 1
+
+        preferred_name = interaction.user.display_name or interaction.user.name
+        clean_pseudo = preferred_name.lower().replace(" ", "-")
+        clean_pseudo = re.sub(r"[^a-z0-9\-_]", "", clean_pseudo)
+        clean_pseudo = re.sub(r"-+", "-", clean_pseudo).strip("-")
+        if not clean_pseudo:
+            clean_pseudo = re.sub(r"[^a-z0-9\-_]", "", interaction.user.name.lower()).strip("-") or "ticket"
+        clean_pseudo = clean_pseudo[:25].rstrip("-")
+
+        ticket_name = f"{clean_pseudo}-{user_ticket_number:03d}"
+
+        existing_channel_names = {c.name.lower() for c in guild.channels}
+        while ticket_name.lower() in existing_channel_names:
+            user_ticket_number += 1
+            ticket_name = f"{clean_pseudo}-{user_ticket_number:03d}"
+
+        user_pseudo = interaction.user.display_name or interaction.user.name
+        ticket = Ticket(
+            panel_id=panel.id,
+            channel_id=None,
+            creator_id=interaction.user.id,
+            creator_username=user_pseudo,
+            ticket_name=ticket_name,
+            user_ticket_number=user_ticket_number,
+            form_answers=answers_dict,
+            status="open",
+        )
+        session.add(ticket)
+        await session.flush()
+        ticket_id = ticket.id
+
+        # 3. Création du salon textuel avec le nom personnalisé
+        try:
+            channel = await guild.create_text_channel(
+                name=ticket_name, category=category, overwrites=overwrites
+            )
+            ticket.channel_id = channel.id
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Erreur création salon ticket: {e}")
+            return await interaction.followup.send(f"❌ Erreur lors de la création du salon : {e}", ephemeral=True)
+
+    # 4. Téléchargement des éventuels fichiers uploadés dans la modale (Component Type 19)
+    discord_files = []
+    if uploaded_attachments:
+        import aiohttp
+        async with aiohttp.ClientSession() as http_sess:
+            for att in uploaded_attachments[:10]:
+                url = att.get("url")
+                fname = att.get("filename") or "fichier"
+                if url:
+                    try:
+                        async with http_sess.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                            if resp.status == 200:
+                                data_bytes = await resp.read()
+                                discord_files.append(discord.File(io.BytesIO(data_bytes), filename=fname))
+                    except Exception as dl_err:
+                        logger.warning(f"Impossible de télécharger la pièce jointe {fname}: {dl_err}")
+
+    # 5. Construction de l'Embed de bienvenue
+    color_int = int(panel.embed_color.lstrip('#'), 16) if panel.embed_color else 0x2ecc71
+    embed = discord.Embed(
+        description=panel.intro_message or "Bienvenue dans votre ticket !",
+        color=discord.Color(color_int),
+    )
+
+    for label, value in answers_dict.items():
+        display_val = str(value).strip() if value is not None and str(value).strip() else "*Non renseigné*"
+        embed.add_field(name=str(label)[:256], value=display_val[:1024], inline=False)
+
+    embed.set_footer(text=f"Système de Ticketing - {ticket_name} (ID: {ticket_id})")
+
+    # 6. Pings paramétrables (créateur et/ou rôle staff)
+    pings = []
+    if getattr(panel, "ping_creator", True):
+        pings.append(interaction.user.mention)
+    if panel.ping_role_id:
+        try:
+            r_id = int(str(panel.ping_role_id).strip())
+            if r_id > 0:
+                pings.append(f"<@&{r_id}>")
+        except Exception:
+            pass
+
+    content = " ".join(pings) if pings else None
+
+    # 7. Envoi du message initial avec les boutons d'action (Fermer & Fermer avec raison) + fichiers joints
+    try:
+        if discord_files:
+            sent_msg = await channel.send(content=content, embed=embed, files=discord_files, view=TicketView(panel))
+            # Mettre à jour les URLs dans form_answers avec les URLs permanentes du message posté dans le salon
+            if sent_msg and sent_msg.attachments:
+                perm_by_name = {a.filename: a.url for a in sent_msg.attachments}
+                updated_answers = dict(answers_dict)
+                changed = False
+                for att in (uploaded_attachments or []):
+                    lbl = att.get("label")
+                    fn = att.get("filename")
+                    old_url = att.get("url")
+                    new_url = perm_by_name.get(fn)
+                    if lbl and old_url and new_url and lbl in updated_answers:
+                        updated_answers[lbl] = str(updated_answers[lbl]).replace(old_url, new_url)
+                        changed = True
+                if changed:
+                    async with AsyncSessionLocal() as session:
+                        t_db = await session.get(Ticket, ticket_id)
+                        if t_db:
+                            t_db.form_answers = updated_answers
+                            await session.commit()
+        else:
+            await channel.send(content=content, embed=embed, view=TicketView(panel))
+    except Exception as send_err:
+        logger.warning(f"Erreur envoi avec fichiers joints, fallback sans fichiers: {send_err}")
+        await channel.send(content=content, embed=embed, view=TicketView(panel))
+
+    await interaction.followup.send(f"✅ Ticket ouvert : {channel.mention}", ephemeral=True)
+
+
+async def send_dm_transcript_to_creator(
+    bot_client: discord.Client,
+    ticket: Ticket,
+    panel: Optional[Panel],
+    closed_by_display: str,
+    close_reason: Optional[str],
+    transcript_html: Optional[str],
+) -> bool:
+    """Envoie automatiquement le résumé de fermeture et le transcript HTML en Message Privé au créateur du ticket."""
+    if not ticket or not ticket.creator_id:
+        return False
+
+    try:
+        user = bot_client.get_user(ticket.creator_id)
+        if not user:
+            user = await bot_client.fetch_user(ticket.creator_id)
+        if not user:
+            return False
+
+        color_int = int(panel.embed_color.lstrip('#'), 16) if (panel and getattr(panel, "embed_color", None)) else 0x5865F2
+        t_label = getattr(ticket, "ticket_name", None) or f"ticket-{ticket.id:03d}"
+        panel_name = panel.name if panel and panel.name else "Support"
+
+        dm_embed = discord.Embed(
+            title=f"🔒 Ticket fermé — {t_label}",
+            description=(
+                "Votre ticket a été clôturé. Vous trouverez ci-dessous le récapitulatif "
+                "ainsi que l'archive complète de la conversation en pièce jointe."
+            ),
+            color=discord.Color(color_int),
+            timestamp=datetime.datetime.utcnow(),
+        )
+        dm_embed.add_field(name="📂 Catégorie / Panel", value=panel_name, inline=True)
+        dm_embed.add_field(name="👤 Fermé par", value=closed_by_display, inline=True)
+
+        if close_reason and str(close_reason).strip():
+            dm_embed.add_field(
+                name="📝 Motif de la fermeture",
+                value=f"> {str(close_reason).strip()[:1000]}",
+                inline=False,
+            )
+
+        dm_embed.set_footer(text="Téléchargez et ouvrez le fichier .html dans votre navigateur pour relire la conversation.")
+
+        if transcript_html:
+            dm_file = discord.File(
+                io.BytesIO(transcript_html.encode("utf-8")),
+                filename=f"transcript-{t_label}.html",
+            )
+            await user.send(embed=dm_embed, file=dm_file)
+        else:
+            await user.send(embed=dm_embed)
+        return True
+    except discord.Forbidden:
+        logger.info(f"[{INSTANCE_ID}] Impossible d'envoyer le transcript en MP à {ticket.creator_id} (MP fermés).")
+        return False
+    except Exception as e:
+        logger.warning(f"[{INSTANCE_ID}] Erreur lors de l'envoi du transcript en MP à {ticket.creator_id}: {e}")
+        return False
+
+
+async def execute_ticket_close(interaction: discord.Interaction, close_reason: Optional[str] = None):
+    """Logique partagée de fermeture d'un ticket (avec ou sans motif), archivage et envoi du transcript en MP."""
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    channel = interaction.channel
+
+    async with AsyncSessionLocal() as session:
+        ticket = await find_ticket_for_channel(session, channel)
+        if not ticket:
+            logger.warning(f"[{INSTANCE_ID}] execute_ticket_close: aucun ticket trouvé pour le salon #{getattr(channel, 'name', '?')}")
+            return await interaction.followup.send("❌ Ticket introuvable.", ephemeral=True)
+
+        panel = await session.get(Panel, ticket.panel_id)
+
+        # Si le ticket est déjà fermé : nettoyer les boutons et informer
+        if ticket.status == "closed":
+            await remove_close_buttons_from_channel(channel)
+            return await interaction.followup.send("ℹ️ Ce ticket est déjà fermé.", ephemeral=True)
+
+        transcript = await chat_exporter.export(
+            channel,
+            limit=None,
+            tz_info="Europe/Paris",
+            military_time=True,
+            bot=interaction.client,
+        )
+
+        clean_reason = str(close_reason).strip() if close_reason and str(close_reason).strip() else None
+        closer_name = interaction.user.display_name or interaction.user.name
+
+        ticket.status = "closed"
+        ticket.updated_at = datetime.datetime.utcnow()
+        ticket.closed_by_username = closer_name
+        ticket.close_reason = clean_reason
+
+        res_arc = await session.execute(select(TicketArchive).where(TicketArchive.ticket_id == ticket.id))
+        archive = res_arc.scalar_one_or_none()
+        if archive:
+            archive.html_content = transcript  # Écrase l'ancienne retranscription
+        else:
+            session.add(TicketArchive(ticket_id=ticket.id, html_content=transcript))
+        await session.commit()
+
+        # Retirer l'accès au membre créateur
+        member = interaction.guild.get_member(ticket.creator_id)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(ticket.creator_id)
+            except Exception:
+                member = None
+        if member:
+            try:
+                await channel.set_permissions(member, overwrite=None)
+            except Exception:
+                pass
+
+        # Déplacer vers la catégorie d'archive si configurée
+        if panel and panel.archive_category_id:
+            try:
+                arch_id = int(str(panel.archive_category_id).strip())
+                cat = interaction.guild.get_channel(arch_id) or discord.utils.get(interaction.guild.categories, id=arch_id)
+                if not cat:
+                    try:
+                        cat = await interaction.client.fetch_channel(arch_id)
+                    except Exception:
+                        pass
+                if cat:
+                    await channel.edit(category=cat)
+            except Exception as e:
+                logger.warning(f"Erreur déplacement archive: {e}")
+
+        # 1. Enlever TOUS les boutons 'Fermer' et 'Fermer avec raison' du salon
+        await remove_close_buttons_from_channel(channel)
+
+        # 2. Envoyer le résumé + transcript en MP au créateur si activé sur le panel
+        dm_enabled = True if panel is None else (bool(panel.dm_transcript_on_close) if getattr(panel, "dm_transcript_on_close", None) is not None else True)
+        dm_sent = False
+        if dm_enabled:
+            dm_sent = await send_dm_transcript_to_creator(
+                bot_client=interaction.client,
+                ticket=ticket,
+                panel=panel,
+                closed_by_display=f"{closer_name} ({interaction.user.mention})",
+                close_reason=clean_reason,
+                transcript_html=transcript,
+            )
+
+        # 3. Envoyer l'archive dans le salon avec la vue contenant Ré-ouvrir et Supprimer
+        desc_parts = [
+            f"Le ticket a été fermé par {interaction.user.mention}.",
+            "La conversation a été archivée.",
+        ]
+        if clean_reason:
+            desc_parts.append(f"\n📝 **Raison de la fermeture :**\n> {clean_reason}")
+
+        embed = discord.Embed(
+            title="🔒 Ticket Fermé",
+            description="\n".join(desc_parts),
+            color=discord.Color.red(),
+        )
+        if dm_enabled:
+            embed.set_footer(
+                text="📩 Transcript envoyé en MP au créateur." if dm_sent else "⚠️ Transcript non envoyé en MP (MP du membre fermés)."
+            )
+
+        if transcript:
+            file = discord.File(io.BytesIO(transcript.encode()), filename=f"transcript-{ticket.id}.html")
+            await channel.send(embed=embed, file=file, view=ArchivedTicketView(panel))
+        else:
+            await channel.send(embed=embed, view=ArchivedTicketView(panel))
+
+
+class CloseReasonModal(discord.ui.Modal, title="Fermer le ticket avec raison"):
+    reason_input = discord.ui.TextInput(
+        label="Motif de la fermeture",
+        style=discord.TextStyle.paragraph,
+        placeholder="Ex : Achat conclu, Refusé - Prix trop haut, Inactivité...",
+        required=True,
+        min_length=2,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await execute_ticket_close(interaction, close_reason=self.reason_input.value)
+
+
 class FormModal(discord.ui.Modal):
     def __init__(self, panel: Panel, fields: list):
-        super().__init__(title=f"{panel.name[:45]}")
+        modal_title = (getattr(panel, "modal_title", None) or panel.name or "Formulaire")[:45]
+        super().__init__(title=modal_title)
         self.panel = panel
-        for f in sorted(fields, key=lambda x: x.order):
+        for f in sorted(fields, key=lambda x: (x.order if x.order is not None else 0, x.id))[:5]:
             style = discord.TextStyle.paragraph if f.is_paragraph else discord.TextStyle.short
             self.add_item(discord.ui.TextInput(
-                label=f.label[:45], style=style, required=f.required, custom_id=f"field_{f.id}"
+                label=f.label[:45],
+                style=style,
+                required=f.required,
+                placeholder=(getattr(f, "placeholder", None) or "")[:100] or None,
+                default=(getattr(f, "default_value", None) or "")[:4000] or None,
+                min_length=getattr(f, "min_length", None),
+                max_length=getattr(f, "max_length", None),
+                custom_id=f"field_{f.id}",
             ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
-
-        # 1. Résolution de la catégorie active
-        category = None
-        if self.panel.active_category_id:
-            try:
-                cat_id = int(str(self.panel.active_category_id).strip())
-                if cat_id > 0:
-                    category = guild.get_channel(cat_id) or discord.utils.get(guild.categories, id=cat_id)
-                    if not category:
-                        try:
-                            category = await interaction.client.fetch_channel(cat_id)
-                        except Exception as e:
-                            logger.warning(f"Impossible de fetch la catégorie {cat_id}: {e}")
-            except Exception as e:
-                logger.error(f"Erreur avec active_category_id: {e}")
-
-        # Permissions : Héritage des permissions de la catégorie (pour que le Staff y ait accès quoi qu'il arrive)
-        overwrites = {}
-        if category and category.overwrites:
-            for target, ow in category.overwrites.items():
-                overwrites[target] = ow
-
-        # @everyone n'a JAMAIS accès au ticket
-        overwrites[guild.default_role] = discord.PermissionOverwrite(read_messages=False)
-        # Seul le membre créateur a accès
-        overwrites[interaction.user] = discord.PermissionOverwrite(
-            read_messages=True, send_messages=True, attach_files=True, embed_links=True
-        )
-        # Le bot conserve les droits complets
-        overwrites[guild.me] = discord.PermissionOverwrite(
-            read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True
-        )
-
-        # Si un rôle staff est configuré sur le panel, on lui garantit explicitement l'accès
-        if self.panel.ping_role_id:
-            try:
-                r_id = int(str(self.panel.ping_role_id).strip())
-                role = guild.get_role(r_id)
-                if role:
-                    overwrites[role] = discord.PermissionOverwrite(
-                        read_messages=True, send_messages=True, attach_files=True, embed_links=True
-                    )
-            except Exception:
-                pass
-
-        # 2. Réponses du formulaire
         answers_dict = {child.label: child.value for child in self.children}
-
-        # 3. Création du ticket en BDD pour obtenir son ID unique incrémenté
-        async with AsyncSessionLocal() as session:
-            user_pseudo = interaction.user.display_name or interaction.user.name
-            ticket = Ticket(
-                panel_id=self.panel.id, 
-                channel_id=None, 
-                creator_id=interaction.user.id,
-                creator_username=user_pseudo,
-                form_answers=answers_dict,
-                status="open"
-            )
-            session.add(ticket)
-            await session.flush()
-            ticket_id = ticket.id
-            ticket_name = f"ticket{ticket_id:03d}"
-
-            # 4. Création du salon textuel avec le nom incrémenté
-            try:
-                channel = await guild.create_text_channel(
-                    name=ticket_name, category=category, overwrites=overwrites
-                )
-                ticket.channel_id = channel.id
-                await session.commit()
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"Erreur création salon ticket: {e}")
-                return await interaction.followup.send(f"❌ Erreur lors de la création du salon : {e}", ephemeral=True)
-
-        # 5. Construction de l'Embed de bienvenue
-        color_int = int(self.panel.embed_color.lstrip('#'), 16) if self.panel.embed_color else 0x2ecc71
-        embed = discord.Embed(
-            description=self.panel.intro_message or "Bienvenue dans votre ticket !", 
-            color=discord.Color(color_int)
-        )
-        
-        for label, value in answers_dict.items():
-            embed.add_field(name=label, value=value, inline=False)
-            
-        embed.set_footer(text=f"Système de Ticketing - {ticket_name}")
-        
-        # 6. Pings paramétrables (créateur et/ou rôle staff)
-        pings = []
-        if getattr(self.panel, "ping_creator", True):
-            pings.append(interaction.user.mention)
-        if self.panel.ping_role_id:
-            try:
-                r_id = int(str(self.panel.ping_role_id).strip())
-                if r_id > 0:
-                    pings.append(f"<@&{r_id}>")
-            except Exception:
-                pass
-        
-        content = " ".join(pings) if pings else None
-        
-        # 7. Envoi du message initial avec uniquement le bouton de fermeture
-        await channel.send(content=content, embed=embed, view=TicketView(self.panel))
-        await interaction.followup.send(f"✅ Ticket ouvert : {channel.mention}", ephemeral=True)
+        await process_ticket_creation(interaction, self.panel, answers_dict)
 
 
 class TicketView(discord.ui.View):
@@ -290,91 +787,86 @@ class TicketView(discord.ui.View):
             label=btn_label,
             style=btn_style,
             custom_id="close_ticket",
-            emoji=btn_emoji
+            emoji=btn_emoji,
         )
         button.callback = self.close_ticket
         self.add_item(button)
 
+        reason_label = getattr(panel, "close_reason_button_text", None) if panel else None
+        reason_color = getattr(panel, "close_reason_button_color", None) if panel else None
+        reason_emoji = getattr(panel, "close_reason_button_emoji", None) if panel else None
+
+        reason_btn = discord.ui.Button(
+            label=reason_label or "Fermer avec raison",
+            style=get_button_style(reason_color or "secondary"),
+            custom_id="close_ticket_reason",
+            emoji=reason_emoji or "📝",
+        )
+        reason_btn.callback = self.close_ticket_with_reason
+        self.add_item(reason_btn)
+
     async def close_ticket(self, interaction: discord.Interaction):
-        await interaction.response.defer()
         channel = interaction.channel
-        
         async with AsyncSessionLocal() as session:
             ticket = await find_ticket_for_channel(session, channel)
             if not ticket:
-                logger.warning(f"[{INSTANCE_ID}] close_ticket: aucun ticket trouvé pour le salon #{channel.name} ({channel.id})")
-                return await interaction.followup.send("❌ Ticket introuvable.", ephemeral=True)
-            
+                return await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
             panel = await session.get(Panel, ticket.panel_id)
 
-            # SÉCURITÉ : Seuls le créateur du ticket et le staff peuvent fermer
-            is_creator = (interaction.user.id == ticket.creator_id)
-            staff_member = is_staff(interaction.user, panel)
-            if not (is_creator or staff_member):
-                return await interaction.followup.send(
-                    "❌ Seuls le créateur du ticket et les membres du staff peuvent fermer ce ticket.", 
-                    ephemeral=True
+        is_creator = (interaction.user.id == ticket.creator_id)
+        staff_member = is_staff(interaction.user, panel)
+        creator_can_close = (
+            bool(panel.creator_can_close)
+            if (panel and getattr(panel, "creator_can_close", None) is not None)
+            else True
+        )
+
+        if not staff_member:
+            if is_creator and not creator_can_close:
+                return await interaction.response.send_message(
+                    "❌ Vous n'êtes pas autorisé à fermer ce ticket vous-même. Un membre du staff s'en chargera.",
+                    ephemeral=True,
                 )
-            
-            # Si le ticket est déjà fermé : nettoyer les boutons et informer
+            if not is_creator:
+                return await interaction.response.send_message(
+                    "❌ Seuls les membres du staff (ou le créateur si autorisé) peuvent fermer ce ticket.",
+                    ephemeral=True,
+                )
+
+        await execute_ticket_close(interaction, close_reason=None)
+
+    async def close_ticket_with_reason(self, interaction: discord.Interaction):
+        channel = interaction.channel
+        async with AsyncSessionLocal() as session:
+            ticket = await find_ticket_for_channel(session, channel)
+            if not ticket:
+                return await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
             if ticket.status == "closed":
                 await remove_close_buttons_from_channel(channel)
-                return await interaction.followup.send("ℹ️ Ce ticket est déjà fermé.", ephemeral=True)
+                return await interaction.response.send_message("ℹ️ Ce ticket est déjà fermé.", ephemeral=True)
+            panel = await session.get(Panel, ticket.panel_id)
 
-            transcript = await chat_exporter.export(
-                channel,
-                limit=None,
-                tz_info="Europe/Paris",
-                military_time=True,
-                bot=interaction.client
-            )
-            
-            ticket.status = "closed"
-            ticket.updated_at = datetime.datetime.utcnow()
-            res_arc = await session.execute(select(TicketArchive).where(TicketArchive.ticket_id == ticket.id))
-            archive = res_arc.scalar_one_or_none()
-            if archive:
-                archive.html_content = transcript # Écrase l'ancienne retranscription
-            else:
-                session.add(TicketArchive(ticket_id=ticket.id, html_content=transcript))
-            await session.commit()
+        is_creator = (interaction.user.id == ticket.creator_id)
+        staff_member = is_staff(interaction.user, panel)
+        creator_can_close_reason = (
+            bool(panel.creator_can_close_with_reason)
+            if (panel and getattr(panel, "creator_can_close_with_reason", None) is not None)
+            else False
+        )
 
-            # Retirer l'accès au membre créateur
-            member = interaction.guild.get_member(ticket.creator_id)
-            if not member:
-                try:
-                    member = await interaction.guild.fetch_member(ticket.creator_id)
-                except Exception:
-                    member = None
-            if member:
-                await channel.set_permissions(member, overwrite=None)
-            
-            # Déplacer vers la catégorie d'archive si configurée
-            if panel and panel.archive_category_id:
-                try:
-                    arch_id = int(str(panel.archive_category_id).strip())
-                    cat = interaction.guild.get_channel(arch_id) or discord.utils.get(interaction.guild.categories, id=arch_id)
-                    if not cat:
-                        try:
-                            cat = await interaction.client.fetch_channel(arch_id)
-                        except Exception:
-                            pass
-                    if cat:
-                        await channel.edit(category=cat)
-                except Exception as e:
-                    logger.warning(f"Erreur déplacement archive: {e}")
+        if not staff_member:
+            if is_creator and not creator_can_close_reason:
+                return await interaction.response.send_message(
+                    "❌ Seuls les membres du staff sont autorisés à utiliser la fermeture avec motif sur ce panel.",
+                    ephemeral=True,
+                )
+            if not is_creator:
+                return await interaction.response.send_message(
+                    "❌ Vous n'avez pas la permission de fermer ce ticket.",
+                    ephemeral=True,
+                )
 
-            # 1. Enlever TOUS les boutons 'Fermer' du salon (message initial et éventuels messages de réouverture)
-            await remove_close_buttons_from_channel(channel)
-
-            # 2. Envoyer l'archive avec la vue contenant UNIQUEMENT Ré-ouvrir et Supprimer
-            file = discord.File(io.BytesIO(transcript.encode()), filename=f"transcript-{ticket.id}.html")
-            embed = discord.Embed(
-                title="🔒 Ticket Fermé", 
-                description=f"Le ticket a été fermé par {interaction.user.mention}.\nLa conversation a été archivée.", 
-                color=discord.Color.red()
-            )
-            await channel.send(embed=embed, file=file, view=ArchivedTicketView(panel))
+        await interaction.response.send_modal(CloseReasonModal())
 
 
 class ArchivedTicketView(discord.ui.View):
@@ -426,6 +918,8 @@ class ArchivedTicketView(discord.ui.View):
                 )
 
             ticket.status = "open"
+            ticket.close_reason = None
+            ticket.closed_by_username = None
             ticket.updated_at = datetime.datetime.utcnow()
             await session.commit()
             
@@ -459,7 +953,7 @@ class ArchivedTicketView(discord.ui.View):
         # Enlever TOUS les boutons d'archive du salon
         await remove_archive_buttons_from_channel(channel)
 
-        # Envoyer le message de réouverture avec SEULEMENT le bouton Fermer
+        # Envoyer le message de réouverture avec les boutons Fermer / Fermer avec raison
         await channel.send(f"🔓 Ticket réouvert par {interaction.user.mention}", view=TicketView(panel))
 
     async def delete(self, interaction: discord.Interaction):
@@ -509,9 +1003,110 @@ bot = TicketingBot()
 
 @bot.listen("on_interaction")
 async def on_interaction(interaction: discord.Interaction):
+    # --- 1. SOUMISSION DE LA MODALE (QUESTIONNAIRE) ---
+    if interaction.type == discord.InteractionType.modal_submit:
+        custom_id = (interaction.data or {}).get("custom_id", "")
+        if not custom_id.startswith("ticket_modal_"):
+            return
+        try:
+            panel_id = int(custom_id.split("_")[-1])
+        except (IndexError, ValueError):
+            return
+
+        logger.info(f"[{INSTANCE_ID}] Soumission modale ticket_modal_{panel_id} par {interaction.user} ({interaction.user.id})")
+        try:
+            async with AsyncSessionLocal() as session:
+                panel = await session.get(Panel, panel_id)
+                if not panel:
+                    return await interaction.response.send_message("❌ Ce panneau n'existe plus.", ephemeral=True)
+                res = await session.execute(
+                    select(FormField)
+                    .where(FormField.panel_id == panel_id)
+                    .order_by(FormField.order.asc(), FormField.id.asc())
+                )
+                fields = res.scalars().all()
+
+            fields_by_cid = {f"field_{f.id}": f for f in fields}
+            answers_dict = {}
+            uploaded_attachments = []
+            resolved_attachments = ((interaction.data or {}).get("resolved") or {}).get("attachments") or {}
+
+            raw_components = (interaction.data or {}).get("components", [])
+            for idx, top_comp in enumerate(raw_components):
+                comp_type = top_comp.get("type")
+                if comp_type == 18:  # ComponentType.LABEL
+                    inner = top_comp.get("component") or {}
+                    fallback_label = top_comp.get("label") or f"Question {idx + 1}"
+                else:  # ActionRow (type 1)
+                    children = top_comp.get("components") or []
+                    inner = children[0] if children else {}
+                    fallback_label = f"Question {idx + 1}"
+
+                cid = inner.get("custom_id", "")
+                field_obj = fields_by_cid.get(cid)
+                label = field_obj.label if field_obj and field_obj.label else fallback_label
+                ftype = get_effective_field_type(field_obj) if field_obj else "short_text"
+                inner_type = inner.get("type")
+
+                if inner_type == 19 or ftype == "file_upload":
+                    vals = inner.get("values") or []
+                    file_links = []
+                    for att_id in vals:
+                        att_info = resolved_attachments.get(str(att_id)) or {}
+                        fname = att_info.get("filename") or f"fichier_{att_id}"
+                        furl = att_info.get("url") or att_info.get("proxy_url") or ""
+                        if furl:
+                            uploaded_attachments.append({
+                                "label": label,
+                                "filename": fname,
+                                "url": furl,
+                                "content_type": att_info.get("content_type", ""),
+                            })
+                            file_links.append(f"📎 [{fname}]({furl})")
+                        else:
+                            file_links.append(f"📎 {fname}")
+                    formatted = "\n".join(file_links)
+                elif "values" in inner:
+                    vals = inner.get("values") or []
+                    if ftype == "user_select":
+                        formatted = ", ".join(f"<@{v}>" for v in vals)
+                    elif ftype == "role_select":
+                        formatted = ", ".join(f"<@&{v}>" for v in vals)
+                    elif ftype == "channel_select":
+                        formatted = ", ".join(f"<#{v}>" for v in vals)
+                    else:
+                        # StringSelect : retrouver le label/emoji d'origine si configuré
+                        opt_map = {}
+                        if field_obj and getattr(field_obj, "options", None):
+                            for o in field_obj.options:
+                                if isinstance(o, dict) and o.get("label"):
+                                    k = str(o.get("value") or o.get("label")).strip()
+                                    em = str(o.get("emoji") or "").strip()
+                                    opt_map[k] = f"{em} {o['label']}".strip() if em else str(o["label"]).strip()
+                        formatted = ", ".join(opt_map.get(str(v), str(v)) for v in vals)
+                else:
+                    formatted = str(inner.get("value") or "").strip()
+
+                answers_dict[label] = formatted if formatted else "*Non renseigné*"
+
+            await process_ticket_creation(interaction, panel, answers_dict, uploaded_attachments=uploaded_attachments)
+        except (discord.InteractionResponded, discord.NotFound) as e:
+            logger.warning(f"[{INSTANCE_ID}] Soumission ticket_modal_{panel_id} déjà traitée ou expirée : {e}")
+        except Exception as e:
+            logger.exception(f"[{INSTANCE_ID}] Erreur lors du traitement de ticket_modal_{panel_id}: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Une erreur est survenue lors de la création du ticket.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Une erreur est survenue lors de la création du ticket.", ephemeral=True)
+            except Exception:
+                pass
+        return
+
+    # --- 2. CLIC SUR LE BOUTON D'OUVERTURE DU PANEL ---
     if interaction.type != discord.InteractionType.component:
         return
-    custom_id = interaction.data.get('custom_id', '')
+    custom_id = (interaction.data or {}).get('custom_id', '')
     if not custom_id.startswith("panel_"):
         return
 
@@ -530,8 +1125,6 @@ async def on_interaction(interaction: discord.Interaction):
                     f"[{INSTANCE_ID}] panel_{panel_id} absent de la base de cette instance. "
                     f"Si le clic fonctionne parfois, une AUTRE instance du bot tourne avec le même token."
                 )
-                # On laisse une chance à une éventuelle autre instance (qui possède ce panel) de répondre
-                # en premier : si elle l'a fait, Discord refusera notre réponse et on l'ignore silencieusement.
                 await asyncio.sleep(2)
                 try:
                     await interaction.response.send_message(
@@ -560,15 +1153,19 @@ async def on_interaction(interaction: discord.Interaction):
                         ephemeral=True
                     )
 
-            res = await session.execute(select(FormField).where(FormField.panel_id == panel_id))
+            res = await session.execute(
+                select(FormField)
+                .where(FormField.panel_id == panel_id)
+                .order_by(FormField.order.asc(), FormField.id.asc())
+            )
             fields = res.scalars().all()
 
         if not fields:
-            return await interaction.response.send_message("❌ Aucune question configurée pour ce panneau.", ephemeral=True)
+            # Si aucune question n'est configurée, ouvre directement le ticket sans pop-up
+            return await process_ticket_creation(interaction, panel, {})
 
-        await interaction.response.send_modal(FormModal(panel, fields))
+        await send_custom_modal(interaction, panel, fields)
     except (discord.InteractionResponded, discord.NotFound) as e:
-        # Interaction déjà traitée (autre instance) ou expirée (> 3 s)
         logger.warning(f"[{INSTANCE_ID}] Interaction panel_{panel_id} non traitée : {e}")
     except Exception as e:
         logger.exception(f"[{INSTANCE_ID}] Erreur lors du clic sur panel_{panel_id}: {e}")

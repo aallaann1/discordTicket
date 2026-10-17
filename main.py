@@ -55,12 +55,45 @@ def panel_to_dict(p: Panel) -> dict:
         "close_button_text": p.close_button_text or "Fermer le ticket",
         "close_button_color": p.close_button_color or "danger",
         "close_button_emoji": p.close_button_emoji or "🔒",
+        "close_reason_button_text": getattr(p, "close_reason_button_text", None) or "Fermer avec raison",
+        "close_reason_button_color": getattr(p, "close_reason_button_color", None) or "secondary",
+        "close_reason_button_emoji": getattr(p, "close_reason_button_emoji", None) or "📝",
         "reopen_button_text": p.reopen_button_text or "Ré-ouvrir",
         "reopen_button_color": p.reopen_button_color or "success",
         "reopen_button_emoji": p.reopen_button_emoji or "🔓",
         "delete_button_text": p.delete_button_text or "Supprimer",
         "delete_button_color": p.delete_button_color or "danger",
         "delete_button_emoji": p.delete_button_emoji or "🗑️",
+        "creator_can_close": bool(p.creator_can_close) if getattr(p, "creator_can_close", None) is not None else True,
+        "creator_can_close_with_reason": bool(p.creator_can_close_with_reason) if getattr(p, "creator_can_close_with_reason", None) is not None else False,
+        "dm_transcript_on_close": bool(p.dm_transcript_on_close) if getattr(p, "dm_transcript_on_close", None) is not None else True,
+        "modal_title": getattr(p, "modal_title", None) or "",
+    }
+
+def field_to_dict(f: FormField) -> dict:
+    raw_type = getattr(f, "field_type", None)
+    if not raw_type:
+        effective_type = "paragraph" if getattr(f, "is_paragraph", False) else "short_text"
+    elif raw_type == "short_text" and getattr(f, "is_paragraph", False):
+        effective_type = "paragraph"
+    else:
+        effective_type = raw_type
+    return {
+        "id": f.id,
+        "panel_id": f.panel_id,
+        "label": f.label or "",
+        "field_type": effective_type,
+        "is_paragraph": effective_type == "paragraph" or bool(getattr(f, "is_paragraph", False)),
+        "description": getattr(f, "description", None) or "",
+        "placeholder": getattr(f, "placeholder", None) or "",
+        "required": bool(f.required) if f.required is not None else True,
+        "min_length": getattr(f, "min_length", None),
+        "max_length": getattr(f, "max_length", None),
+        "default_value": getattr(f, "default_value", None) or "",
+        "options": getattr(f, "options", None) or [],
+        "min_values": getattr(f, "min_values", 1) if getattr(f, "min_values", None) is not None else 1,
+        "max_values": getattr(f, "max_values", 1) if getattr(f, "max_values", None) is not None else 1,
+        "order": f.order if f.order is not None else 0,
     }
 
 def ticket_to_dict(t: Ticket) -> dict:
@@ -70,8 +103,12 @@ def ticket_to_dict(t: Ticket) -> dict:
         "channel_id": str(t.channel_id) if t.channel_id else None,
         "creator_id": str(t.creator_id) if t.creator_id else None,
         "creator_username": getattr(t, "creator_username", None),
+        "ticket_name": getattr(t, "ticket_name", None) or f"ticket{t.id:03d}",
+        "user_ticket_number": getattr(t, "user_ticket_number", None),
         "status": t.status,
         "form_answers": t.form_answers,
+        "close_reason": getattr(t, "close_reason", None),
+        "closed_by_username": getattr(t, "closed_by_username", None),
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
@@ -216,12 +253,19 @@ async def create_panel(panel_data: PanelCreate):
             close_button_text=panel_data.close_button_text,
             close_button_color=panel_data.close_button_color,
             close_button_emoji=panel_data.close_button_emoji,
+            close_reason_button_text=panel_data.close_reason_button_text,
+            close_reason_button_color=panel_data.close_reason_button_color,
+            close_reason_button_emoji=panel_data.close_reason_button_emoji,
             reopen_button_text=panel_data.reopen_button_text,
             reopen_button_color=panel_data.reopen_button_color,
             reopen_button_emoji=panel_data.reopen_button_emoji,
             delete_button_text=panel_data.delete_button_text,
             delete_button_color=panel_data.delete_button_color,
             delete_button_emoji=panel_data.delete_button_emoji,
+            creator_can_close=panel_data.creator_can_close if panel_data.creator_can_close is not None else True,
+            creator_can_close_with_reason=panel_data.creator_can_close_with_reason if panel_data.creator_can_close_with_reason is not None else False,
+            dm_transcript_on_close=panel_data.dm_transcript_on_close if panel_data.dm_transcript_on_close is not None else True,
+            modal_title=panel_data.modal_title,
         )
         if panel_data.active_category_id and str(panel_data.active_category_id).strip():
             try:
@@ -331,30 +375,106 @@ async def send_panel_to_discord(panel_id: int, channel_id: int):
         
         return {"success": True, "message": "Bouton envoyé dans le salon !"}
 
+def _normalize_field_payload(field_data: FieldCreate) -> dict:
+    data = field_data.dict()
+    ftype = data.get("field_type") or ("paragraph" if data.get("is_paragraph") else "short_text")
+    if ftype not in ("short_text", "paragraph", "select", "user_select", "role_select", "channel_select", "file_upload"):
+        ftype = "short_text"
+    data["field_type"] = ftype
+    data["is_paragraph"] = (ftype == "paragraph")
+
+    is_req = bool(data.get("required")) if data.get("required") is not None else True
+    data["required"] = is_req
+
+    # Nettoyage des options pour select
+    if ftype == "select":
+        raw_opts = data.get("options") or []
+        cleaned_opts = []
+        for opt in raw_opts[:25]:
+            if isinstance(opt, dict):
+                lbl = str(opt.get("label") or "").strip()[:100]
+                if not lbl:
+                    continue
+                val = str(opt.get("value") or lbl).strip()[:100]
+                desc = str(opt.get("description") or "").strip()[:100]
+                emoji = str(opt.get("emoji") or "").strip()
+                cleaned_opts.append({
+                    "label": lbl,
+                    "value": val,
+                    "description": desc,
+                    "emoji": emoji,
+                    "default": bool(opt.get("default", False))
+                })
+        data["options"] = cleaned_opts
+    elif ftype == "file_upload":
+        data["options"] = None
+        max_v = data.get("max_values")
+        max_v = max(1, min(int(max_v if max_v is not None else 5), 10))
+        min_v = data.get("min_values")
+        if not is_req:
+            min_v = 0
+        else:
+            min_v = max(1, min(int(min_v if min_v is not None else 1), max_v))
+        data["min_values"] = min_v
+        data["max_values"] = max_v
+    else:
+        data["options"] = None
+
+    return data
+
 @app.get("/api/panels/{panel_id}/fields", dependencies=[Depends(get_api_key)])
 async def get_fields(panel_id: int):
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(FormField).where(FormField.panel_id == panel_id))
-        return res.scalars().all()
+        res = await session.execute(
+            select(FormField)
+            .where(FormField.panel_id == panel_id)
+            .order_by(FormField.order.asc(), FormField.id.asc())
+        )
+        return [field_to_dict(f) for f in res.scalars().all()]
 
 @app.post("/api/panels/{panel_id}/fields", dependencies=[Depends(get_api_key)])
 async def create_field(panel_id: int, field_data: FieldCreate):
     async with AsyncSessionLocal() as session:
-        field = FormField(panel_id=panel_id, **field_data.dict())
+        count_res = await session.execute(
+            select(func.count(FormField.id)).where(FormField.panel_id == panel_id)
+        )
+        if (count_res.scalar() or 0) >= 5:
+            raise HTTPException(status_code=400, detail="Discord limite les formulaires à 5 questions maximum.")
+        payload = _normalize_field_payload(field_data)
+        if payload["field_type"] == "select" and not payload.get("options"):
+            raise HTTPException(status_code=400, detail="Une liste déroulante doit comporter au moins 1 choix.")
+        field = FormField(panel_id=panel_id, **payload)
         session.add(field)
         await session.commit()
-        return field
+        return field_to_dict(field)
 
 @app.put("/api/fields/{field_id}", dependencies=[Depends(get_api_key)])
 async def update_field(field_id: int, field_data: FieldCreate):
     async with AsyncSessionLocal() as session:
         field = await session.get(FormField, field_id)
         if field:
-            for k, v in field_data.dict().items():
+            payload = _normalize_field_payload(field_data)
+            if payload["field_type"] == "select" and not payload.get("options"):
+                raise HTTPException(status_code=400, detail="Une liste déroulante doit comporter au moins 1 choix.")
+            for k, v in payload.items():
                 setattr(field, k, v)
             await session.commit()
-            return field
-        raise HTTPException(404)
+            return field_to_dict(field)
+        raise HTTPException(404, detail="Question introuvable.")
+
+@app.put("/api/panels/{panel_id}/fields/reorder", dependencies=[Depends(get_api_key)])
+async def reorder_fields(panel_id: int, request: Request):
+    body = await request.json()
+    field_ids = body.get("field_ids") or []
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(FormField).where(FormField.panel_id == panel_id))
+        fields_map = {f.id: f for f in res.scalars().all()}
+        for idx, fid in enumerate(field_ids):
+            if int(fid) in fields_map:
+                fields_map[int(fid)].order = idx
+        await session.commit()
+        ordered = sorted(fields_map.values(), key=lambda x: (x.order or 0, x.id))
+        return [field_to_dict(f) for f in ordered]
 
 @app.delete("/api/fields/{field_id}", dependencies=[Depends(get_api_key)])
 async def delete_field(field_id: int):
@@ -410,7 +530,15 @@ async def get_tickets(limit: Optional[int] = Query(None), offset: int = 0):
         return result
 
 @app.post("/api/tickets/{ticket_id}/close", dependencies=[Depends(get_api_key)])
-async def close_ticket(ticket_id: int):
+async def close_ticket(ticket_id: int, request: Request):
+    close_reason = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("reason"):
+            close_reason = str(body.get("reason")).strip()
+    except Exception:
+        pass
+
     async with AsyncSessionLocal() as session:
         ticket = await session.get(Ticket, ticket_id)
         if not ticket:
@@ -425,15 +553,21 @@ async def close_ticket(ticket_id: int):
             except Exception:
                 pass
 
-        # Fallback : si non trouvé par ID, chercher le salon par son nom incrémenté (ex: ticket006)
+        # Fallback : si non trouvé par ID, chercher le salon par son nom (ex: alan-001 ou ticket006)
         if not channel:
-            target_name = f"ticket{ticket.id:03d}"
+            candidates = []
+            if getattr(ticket, "ticket_name", None):
+                candidates.append(ticket.ticket_name)
+            candidates.append(f"ticket{ticket.id:03d}")
             for guild in bot.guilds:
-                ch = discord.utils.get(guild.text_channels, name=target_name)
-                if ch:
-                    channel = ch
-                    ticket.channel_id = ch.id
-                    logger.info(f"Salon retrouvé par nom '{target_name}' : ID {ch.id}")
+                for target_name in candidates:
+                    ch = discord.utils.get(guild.text_channels, name=target_name)
+                    if ch:
+                        channel = ch
+                        ticket.channel_id = ch.id
+                        logger.info(f"Salon retrouvé par nom '{target_name}' : ID {ch.id}")
+                        break
+                if channel:
                     break
 
         transcript = ""
@@ -452,6 +586,9 @@ async def close_ticket(ticket_id: int):
 
         ticket.status = "closed"
         ticket.updated_at = datetime.datetime.utcnow()
+        ticket.closed_by_username = "Dashboard Web"
+        if close_reason:
+            ticket.close_reason = close_reason
         
         if transcript:
             res_arc = await session.execute(select(TicketArchive).where(TicketArchive.ticket_id == ticket.id))
@@ -496,10 +633,16 @@ async def close_ticket(ticket_id: int):
             # 4. Envoyer le message d'archive avec boutons Ré-ouvrir et Supprimer
             try:
                 import io
-                from bot import ArchivedTicketView
+                from bot import ArchivedTicketView, send_dm_transcript_to_creator
+                desc_lines = [
+                    "Le ticket a été fermé depuis le **Dashboard Web**.",
+                    "La conversation a été archivée."
+                ]
+                if close_reason:
+                    desc_lines.append(f"\n📝 **Raison de la fermeture :**\n> {close_reason}")
                 embed = discord.Embed(
                     title="🔒 Ticket Fermé",
-                    description="Le ticket a été fermé depuis le Dashboard Web.\nLa conversation a été archivée.",
+                    description="\n".join(desc_lines),
                     color=discord.Color.red()
                 )
                 if transcript:
@@ -507,6 +650,17 @@ async def close_ticket(ticket_id: int):
                     await channel.send(embed=embed, file=file, view=ArchivedTicketView(panel))
                 else:
                     await channel.send(embed=embed, view=ArchivedTicketView(panel))
+
+                # 5. Envoyer le résumé + transcript en MP au créateur si activé sur le panel
+                if panel is None or getattr(panel, "dm_transcript_on_close", True):
+                    await send_dm_transcript_to_creator(
+                        bot_client=bot,
+                        ticket=ticket,
+                        panel=panel,
+                        closed_by_display="le Staff (Dashboard Web)",
+                        close_reason=close_reason,
+                        transcript_html=transcript
+                    )
             except Exception as e:
                 logger.warning(f"Erreur envoi message archive: {e}")
 
