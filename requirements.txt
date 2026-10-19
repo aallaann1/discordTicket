@@ -6,3 +6,4 @@ asyncpg==0.29.0
 python-dotenv==1.0.1
 chat-exporter==2.8.2
 pydantic==2.5.2
+watchfiles>=0.21.0

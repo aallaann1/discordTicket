@@ -11,7 +11,7 @@ import re
 from typing import Optional
 from sqlalchemy.future import select
 from sqlalchemy import func
-from database import AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive
+from database import AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +183,183 @@ class PanelView(discord.ui.View):
             emoji=panel.button_emoji if panel.button_emoji else None
         )
         self.add_item(button)
+
+
+def build_panel_embed(panel: Panel) -> discord.Embed:
+    """Construit un objet discord.Embed riche et moderne pour un panel de tickets."""
+    raw_color = panel.embed_color or "#2ecc71"
+    try:
+        color_int = int(str(raw_color).lstrip('#'), 16)
+    except Exception:
+        color_int = 0x2ecc71
+
+    title_url = str(panel.embed_title_url).strip() if getattr(panel, "embed_title_url", None) else None
+    if title_url and not (title_url.startswith("http://") or title_url.startswith("https://")):
+        title_url = None
+
+    embed = discord.Embed(
+        title=(panel.embed_title or "Système de Ticket")[:256],
+        description=(panel.embed_description or "Cliquez sur le bouton ci-dessous pour ouvrir un ticket.")[:4096],
+        color=discord.Color(color_int),
+        url=title_url,
+    )
+
+    # 1. Author (Auteur avec icône et lien cliquable)
+    author_name = str(getattr(panel, "embed_author_name", "") or "").strip()
+    if author_name:
+        author_kwargs = {"name": author_name[:256]}
+        a_icon = str(getattr(panel, "embed_author_icon_url", "") or "").strip()
+        if a_icon and (a_icon.startswith("http://") or a_icon.startswith("https://")):
+            author_kwargs["icon_url"] = a_icon
+        a_url = str(getattr(panel, "embed_author_url", "") or "").strip()
+        if a_url and (a_url.startswith("http://") or a_url.startswith("https://")):
+            author_kwargs["url"] = a_url
+        embed.set_author(**author_kwargs)
+
+    # 2. Thumbnail (Miniature en haut à droite)
+    thumb_url = str(getattr(panel, "embed_thumbnail_url", "") or "").strip()
+    if thumb_url and (thumb_url.startswith("http://") or thumb_url.startswith("https://")):
+        embed.set_thumbnail(url=thumb_url)
+
+    # 3. Image (Grande bannière en bas de l'embed)
+    img_url = str(getattr(panel, "embed_image_url", "") or "").strip()
+    if img_url and (img_url.startswith("http://") or img_url.startswith("https://")):
+        embed.set_image(url=img_url)
+
+    # 4. Footer & Icon
+    footer_text = str(getattr(panel, "embed_footer_text", "") or "Système de Ticketing").strip()
+    if not footer_text:
+        footer_text = "Système de Ticketing"
+    footer_kwargs = {"text": footer_text[:2048]}
+    f_icon = str(getattr(panel, "embed_footer_icon_url", "") or "").strip()
+    if f_icon and (f_icon.startswith("http://") or f_icon.startswith("https://")):
+        footer_kwargs["icon_url"] = f_icon
+    embed.set_footer(**footer_kwargs)
+
+    # 5. Timestamp
+    if getattr(panel, "embed_show_timestamp", False):
+        embed.timestamp = datetime.datetime.utcnow()
+
+    return embed
+
+
+def build_info_embed(info: InfoEmbed) -> discord.Embed:
+    """Construit un objet discord.Embed riche pour un message guide/information (ex: Comment vendre)."""
+    raw_color = getattr(info, "embed_color", None) or "#5865F2"
+    try:
+        color_int = int(str(raw_color).lstrip('#'), 16)
+    except Exception:
+        color_int = 0x5865F2
+
+    title_url = str(getattr(info, "embed_title_url", "") or "").strip()
+    if title_url and not (title_url.startswith("http://") or title_url.startswith("https://")):
+        title_url = None
+
+    embed = discord.Embed(
+        title=(getattr(info, "embed_title", "") or "📖 Comment vendre votre collection ?")[:256],
+        description=(getattr(info, "embed_description", "") or "")[:4096],
+        color=discord.Color(color_int),
+        url=title_url,
+    )
+
+    # 1. Author
+    author_name = str(getattr(info, "embed_author_name", "") or "").strip()
+    if author_name:
+        author_kwargs = {"name": author_name[:256]}
+        a_icon = str(getattr(info, "embed_author_icon_url", "") or "").strip()
+        if a_icon and (a_icon.startswith("http://") or a_icon.startswith("https://")):
+            author_kwargs["icon_url"] = a_icon
+        a_url = str(getattr(info, "embed_author_url", "") or "").strip()
+        if a_url and (a_url.startswith("http://") or a_url.startswith("https://")):
+            author_kwargs["url"] = a_url
+        embed.set_author(**author_kwargs)
+
+    # 2. Thumbnail
+    thumb_url = str(getattr(info, "embed_thumbnail_url", "") or "").strip()
+    if thumb_url and (thumb_url.startswith("http://") or thumb_url.startswith("https://")):
+        embed.set_thumbnail(url=thumb_url)
+
+    # 3. Image
+    img_url = str(getattr(info, "embed_image_url", "") or "").strip()
+    if img_url and (img_url.startswith("http://") or img_url.startswith("https://")):
+        embed.set_image(url=img_url)
+
+    # 4. Footer & Icon
+    footer_text = str(getattr(info, "embed_footer_text", "") or "BRB Collection • Guide Officiel").strip()
+    if not footer_text:
+        footer_text = "BRB Collection • Guide Officiel"
+    footer_kwargs = {"text": footer_text[:2048]}
+    f_icon = str(getattr(info, "embed_footer_icon_url", "") or "").strip()
+    if f_icon and (f_icon.startswith("http://") or f_icon.startswith("https://")):
+        footer_kwargs["icon_url"] = f_icon
+    embed.set_footer(**footer_kwargs)
+
+    # 5. Timestamp
+    if getattr(info, "embed_show_timestamp", False):
+        embed.timestamp = datetime.datetime.utcnow()
+
+    return embed
+
+
+def build_announcement_embed(ann) -> Optional[discord.Embed]:
+    """Construit un objet discord.Embed riche pour une annonce."""
+    title = str(getattr(ann, "embed_title", None) or "").strip()
+    desc = str(getattr(ann, "embed_description", None) or "").strip()
+    img = str(getattr(ann, "embed_image_url", None) or "").strip()
+    thumb = str(getattr(ann, "embed_thumbnail_url", None) or "").strip()
+    author = str(getattr(ann, "embed_author_name", None) or "").strip()
+    footer = str(getattr(ann, "embed_footer_text", None) or "").strip()
+
+    # Si aucun champ d'embed n'est renseigné, renvoie None (permet l'envoi de texte simple)
+    if not any([title, desc, img, thumb, author, footer]):
+        return None
+
+    raw_color = getattr(ann, "embed_color", None) or "#5865F2"
+    try:
+        color_int = int(str(raw_color).lstrip('#'), 16)
+    except Exception:
+        color_int = 0x5865F2
+
+    title_url = str(getattr(ann, "embed_title_url", "") or "").strip()
+    if title_url and not (title_url.startswith("http://") or title_url.startswith("https://")):
+        title_url = None
+
+    embed = discord.Embed(
+        title=title[:256] if title else None,
+        description=desc[:4096] if desc else None,
+        color=discord.Color(color_int),
+        url=title_url,
+    )
+
+    if author:
+        author_kwargs = {"name": author[:256]}
+        a_icon = str(getattr(ann, "embed_author_icon_url", "") or "").strip()
+        if a_icon and (a_icon.startswith("http://") or a_icon.startswith("https://")):
+            author_kwargs["icon_url"] = a_icon
+        a_url = str(getattr(ann, "embed_author_url", "") or "").strip()
+        if a_url and (a_url.startswith("http://") or a_url.startswith("https://")):
+            author_kwargs["url"] = a_url
+        embed.set_author(**author_kwargs)
+
+    if thumb and (thumb.startswith("http://") or thumb.startswith("https://")):
+        embed.set_thumbnail(url=thumb)
+
+    if img and (img.startswith("http://") or img.startswith("https://")):
+        embed.set_image(url=img)
+
+    if footer:
+        footer_kwargs = {"text": footer[:2048]}
+        f_icon = str(getattr(ann, "embed_footer_icon_url", "") or "").strip()
+        if f_icon and (f_icon.startswith("http://") or f_icon.startswith("https://")):
+            footer_kwargs["icon_url"] = f_icon
+        embed.set_footer(**footer_kwargs)
+
+    if getattr(ann, "embed_show_timestamp", False):
+        embed.timestamp = datetime.datetime.utcnow()
+
+    return embed
+
+
 
 
 def parse_discord_emoji(emoji_str: str) -> Optional[dict]:
@@ -371,18 +548,30 @@ def build_modal_payload(panel: Panel, fields: list) -> dict:
 
 
 async def send_custom_modal(interaction: discord.Interaction, panel: Panel, fields: list):
-    """Envoie la modale enrichie (Label type 18 + listes déroulantes / champs texte / upload) via l'API HTTP Discord."""
-    from discord.http import Route
+    """Envoie la modale enrichie (Label type 18 + listes déroulantes / champs texte / upload) via l'API Discord."""
+    from discord.interactions import async_context, interaction_response_params
 
     modal_data = build_modal_payload(panel, fields)
-    route = Route(
-        "POST",
-        "/interactions/{interaction_id}/{interaction_token}/callback",
-        interaction_id=interaction.id,
-        interaction_token=interaction.token,
-    )
-    await interaction._state.http.request(route, json={"type": 9, "data": modal_data})
-    interaction.response._responded = True
+    adapter = async_context.get()
+    http = interaction._state.http
+    params = interaction_response_params(9, modal_data)
+    try:
+        await adapter.create_interaction_response(
+            interaction.id,
+            interaction.token,
+            session=interaction._session,
+            proxy=http.proxy,
+            proxy_auth=http.proxy_auth,
+            params=params,
+        )
+        interaction.response._response_type = discord.InteractionResponseType.modal
+    except discord.HTTPException as e:
+        logger.warning(f"[{INSTANCE_ID}] send_custom_modal a échoué ({e}). Tentative de fallback sur FormModal standard.")
+        text_fields = [f for f in fields if get_effective_field_type(f) in ("short_text", "paragraph")]
+        if text_fields and not interaction.response.is_done():
+            await interaction.response.send_modal(FormModal(panel, text_fields))
+        else:
+            raise
 
 
 async def process_ticket_creation(
@@ -507,18 +696,37 @@ async def process_ticket_creation(
                     except Exception as dl_err:
                         logger.warning(f"Impossible de télécharger la pièce jointe {fname}: {dl_err}")
 
-    # 5. Construction de l'Embed de bienvenue
-    color_int = int(panel.embed_color.lstrip('#'), 16) if panel.embed_color else 0x2ecc71
+    # 5. Construction de l'Embed de bienvenue personnalisé
+    intro_color_hex = getattr(panel, "intro_embed_color", None) or panel.embed_color
+    try:
+        color_int = int(str(intro_color_hex).lstrip('#'), 16) if intro_color_hex else 0x2ecc71
+    except Exception:
+        color_int = 0x2ecc71
+
+    intro_title = (getattr(panel, "intro_embed_title", None) or "Bienvenue dans votre ticket").strip()
     embed = discord.Embed(
+        title=intro_title[:256] if intro_title else None,
         description=panel.intro_message or "Bienvenue dans votre ticket !",
         color=discord.Color(color_int),
     )
+
+    # Miniature & Bannière dans le ticket si renseignées
+    intro_thumb = str(getattr(panel, "intro_thumbnail_url", "") or "").strip()
+    if intro_thumb and (intro_thumb.startswith("http://") or intro_thumb.startswith("https://")):
+        embed.set_thumbnail(url=intro_thumb)
+
+    intro_img = str(getattr(panel, "intro_image_url", "") or "").strip()
+    if intro_img and (intro_img.startswith("http://") or intro_img.startswith("https://")):
+        embed.set_image(url=intro_img)
 
     for label, value in answers_dict.items():
         display_val = str(value).strip() if value is not None and str(value).strip() else "*Non renseigné*"
         embed.add_field(name=str(label)[:256], value=display_val[:1024], inline=False)
 
-    embed.set_footer(text=f"Système de Ticketing - {ticket_name} (ID: {ticket_id})")
+    intro_footer = getattr(panel, "intro_footer_text", None)
+    if not intro_footer or not str(intro_footer).strip():
+        intro_footer = f"Système de Ticketing - {ticket_name} (ID: {ticket_id})"
+    embed.set_footer(text=str(intro_footer)[:2048])
 
     # 6. Pings paramétrables (créateur et/ou rôle staff)
     pings = []
@@ -585,30 +793,92 @@ async def send_dm_transcript_to_creator(
         if not user:
             return False
 
-        color_int = int(panel.embed_color.lstrip('#'), 16) if (panel and getattr(panel, "embed_color", None)) else 0x5865F2
         t_label = getattr(ticket, "ticket_name", None) or f"ticket-{ticket.id:03d}"
         panel_name = panel.name if panel and panel.name else "Support"
+        user_name = user.display_name or user.name or "Membre"
+        reason_display = str(close_reason).strip() if (close_reason and str(close_reason).strip()) else "Aucun motif spécifié"
+
+        # Dictionnaire des variables de remplacement pour le texte personnalisé
+        replacements = {
+            "{ticket_name}": t_label,
+            "{user_name}": user_name,
+            "{closed_by}": closed_by_display,
+            "{close_reason}": reason_display,
+            "{reason}": reason_display,
+            "{panel_name}": panel_name,
+        }
+
+        # Couleur de l'embed MP
+        dm_color_hex = getattr(panel, "dm_embed_color", None) or (panel.embed_color if panel else "#5865F2")
+        try:
+            color_int = int(str(dm_color_hex).lstrip('#'), 16) if dm_color_hex else 0x5865F2
+        except Exception:
+            color_int = 0x5865F2
+
+        # Titre personnalisé
+        raw_title = getattr(panel, "dm_embed_title", None) or "🔒 Ticket fermé — {ticket_name}"
+        for k, v in replacements.items():
+            raw_title = raw_title.replace(k, v)
+
+        # URL du Titre
+        title_url = str(getattr(panel, "dm_embed_title_url", "") or "").strip()
+        if title_url and not (title_url.startswith("http://") or title_url.startswith("https://")):
+            title_url = None
+
+        # Description personnalisée avec remplacement des variables et mentions
+        raw_desc = getattr(panel, "dm_embed_description", None)
+        if not raw_desc or not str(raw_desc).strip():
+            raw_desc = (
+                "Votre ticket **{ticket_name}** a été clôturé par **{closed_by}**.\n"
+                "Vous trouverez ci-joint l'archive complète de votre conversation."
+            )
+        for k, v in replacements.items():
+            raw_desc = raw_desc.replace(k, v)
 
         dm_embed = discord.Embed(
-            title=f"🔒 Ticket fermé — {t_label}",
-            description=(
-                "Votre ticket a été clôturé. Vous trouverez ci-dessous le récapitulatif "
-                "ainsi que l'archive complète de la conversation en pièce jointe."
-            ),
+            title=raw_title[:256],
+            description=raw_desc[:4096],
             color=discord.Color(color_int),
-            timestamp=datetime.datetime.utcnow(),
+            url=title_url,
         )
+
+        # Miniature (Thumbnail)
+        thumb_url = str(getattr(panel, "dm_thumbnail_url", "") or "").strip()
+        if thumb_url and (thumb_url.startswith("http://") or thumb_url.startswith("https://")):
+            dm_embed.set_thumbnail(url=thumb_url)
+
+        # Grande Bannière (Image)
+        img_url = str(getattr(panel, "dm_image_url", "") or "").strip()
+        if img_url and (img_url.startswith("http://") or img_url.startswith("https://")):
+            dm_embed.set_image(url=img_url)
+
+        # Champs récapitulatifs
         dm_embed.add_field(name="📂 Catégorie / Panel", value=panel_name, inline=True)
         dm_embed.add_field(name="👤 Fermé par", value=closed_by_display, inline=True)
 
         if close_reason and str(close_reason).strip():
-            dm_embed.add_field(
-                name="📝 Motif de la fermeture",
-                value=f"> {str(close_reason).strip()[:1000]}",
-                inline=False,
-            )
+            # Si le motif n'a pas déjà été inséré dans le corps via {close_reason}, on l'ajoute en field dédié
+            if "{close_reason}" not in (getattr(panel, "dm_embed_description", "") or ""):
+                dm_embed.add_field(
+                    name="📝 Motif de la fermeture",
+                    value=f"> {str(close_reason).strip()[:1000]}",
+                    inline=False,
+                )
 
-        dm_embed.set_footer(text="Téléchargez et ouvrez le fichier .html dans votre navigateur pour relire la conversation.")
+        # Footer & Icon
+        raw_footer = getattr(panel, "dm_footer_text", None) or "Téléchargez et ouvrez le fichier .html pour relire la conversation."
+        for k, v in replacements.items():
+            raw_footer = raw_footer.replace(k, v)
+        footer_kwargs = {"text": raw_footer[:2048]}
+
+        f_icon = str(getattr(panel, "dm_footer_icon_url", "") or "").strip()
+        if f_icon and (f_icon.startswith("http://") or f_icon.startswith("https://")):
+            footer_kwargs["icon_url"] = f_icon
+        dm_embed.set_footer(**footer_kwargs)
+
+        # Horodatage
+        if getattr(panel, "dm_show_timestamp", True):
+            dm_embed.timestamp = datetime.datetime.utcnow()
 
         if transcript_html:
             dm_file = discord.File(
@@ -630,7 +900,10 @@ async def send_dm_transcript_to_creator(
 async def execute_ticket_close(interaction: discord.Interaction, close_reason: Optional[str] = None):
     """Logique partagée de fermeture d'un ticket (avec ou sans motif), archivage et envoi du transcript en MP."""
     if not interaction.response.is_done():
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except (discord.InteractionResponded, discord.HTTPException):
+            pass
     channel = interaction.channel
 
     async with AsyncSessionLocal() as session:
@@ -1164,7 +1437,16 @@ async def on_interaction(interaction: discord.Interaction):
             # Si aucune question n'est configurée, ouvre directement le ticket sans pop-up
             return await process_ticket_creation(interaction, panel, {})
 
-        await send_custom_modal(interaction, panel, fields)
+        has_advanced_components = any(
+            get_effective_field_type(f) in ("select", "user_select", "role_select", "channel_select", "file_upload")
+            for f in fields
+        )
+        if not has_advanced_components:
+            # Questions standard 100% textuelles -> FormModal natif discord.ui (100% stable & compatible)
+            await interaction.response.send_modal(FormModal(panel, fields))
+        else:
+            # Questions avancées (listes déroulantes, upload de fichiers...) -> modal enrichi
+            await send_custom_modal(interaction, panel, fields)
     except (discord.InteractionResponded, discord.NotFound) as e:
         logger.warning(f"[{INSTANCE_ID}] Interaction panel_{panel_id} non traitée : {e}")
     except Exception as e:
@@ -1174,4 +1456,134 @@ async def on_interaction(interaction: discord.Interaction):
                 await interaction.response.send_message("❌ Une erreur est survenue, veuillez réessayer.", ephemeral=True)
         except Exception:
             pass
+
+
+# --- DÉTECTION EN TEMPS RÉEL DE LA SUPPRESSION DE MESSAGES OU SALONS SUR DISCORD ---
+@bot.listen("on_raw_message_delete")
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """Détecte quand un message de panel ou d'info-embed déployé est supprimé manuellement sur Discord."""
+    msg_id = payload.message_id
+    try:
+        async with AsyncSessionLocal() as session:
+            # 1. Panel
+            res = await session.execute(
+                select(Panel).where(Panel.deployed_message_id == msg_id)
+            )
+            panel = res.scalars().first()
+            if panel:
+                logger.info(f"[{INSTANCE_ID}] Message déployé {msg_id} du panel '{panel.name}' (ID {panel.id}) supprimé sur Discord. Statut réinitialisé à non déployé.")
+                panel.deployed_channel_id = None
+                panel.deployed_message_id = None
+                await session.commit()
+
+            # 2. InfoEmbed (ex: Comment Vendre)
+            res_ie = await session.execute(
+                select(InfoEmbed).where(InfoEmbed.deployed_message_id == msg_id)
+            )
+            ie = res_ie.scalars().first()
+            if ie:
+                logger.info(f"[{INSTANCE_ID}] Message déployé {msg_id} du guide '{ie.key}' supprimé sur Discord. Statut réinitialisé.")
+                ie.deployed_message_id = None
+                await session.commit()
+
+            # 3. Announcement
+            res_ann = await session.execute(
+                select(Announcement).where(Announcement.message_id == msg_id)
+            )
+            ann = res_ann.scalars().first()
+            if ann:
+                logger.info(f"[{INSTANCE_ID}] Message d'annonce {msg_id} ('{ann.title}') supprimé sur Discord. Statut mis à jour.")
+                ann.status = "deleted"
+                ann.message_id = None
+                await session.commit()
+    except Exception as e:
+        logger.error(f"[{INSTANCE_ID}] Erreur dans on_raw_message_delete: {e}")
+
+
+@bot.listen("on_raw_bulk_message_delete")
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    """Détecte quand des messages de panels ou info-embeds sont supprimés en groupe sur Discord."""
+    try:
+        async with AsyncSessionLocal() as session:
+            # 1. Panels
+            res = await session.execute(
+                select(Panel).where(Panel.deployed_message_id.in_(payload.message_ids))
+            )
+            panels = res.scalars().all()
+            if panels:
+                for panel in panels:
+                    logger.info(f"[{INSTANCE_ID}] Message déployé {panel.deployed_message_id} du panel '{panel.name}' supprimé en groupe. Statut réinitialisé.")
+                    panel.deployed_channel_id = None
+                    panel.deployed_message_id = None
+                await session.commit()
+
+            # 2. InfoEmbeds
+            res_ie = await session.execute(
+                select(InfoEmbed).where(InfoEmbed.deployed_message_id.in_(payload.message_ids))
+            )
+            ies = res_ie.scalars().all()
+            if ies:
+                for ie in ies:
+                    logger.info(f"[{INSTANCE_ID}] Message déployé {ie.deployed_message_id} du guide '{ie.key}' supprimé en groupe. Statut réinitialisé.")
+                    ie.deployed_message_id = None
+                await session.commit()
+
+            # 3. Announcements
+            res_ann = await session.execute(
+                select(Announcement).where(Announcement.message_id.in_(payload.message_ids))
+            )
+            anns = res_ann.scalars().all()
+            if anns:
+                for a in anns:
+                    logger.info(f"[{INSTANCE_ID}] Message d'annonce {a.message_id} ('{a.title}') supprimé en groupe. Statut mis à jour.")
+                    a.status = "deleted"
+                    a.message_id = None
+                await session.commit()
+    except Exception as e:
+        logger.error(f"[{INSTANCE_ID}] Erreur dans on_raw_bulk_message_delete: {e}")
+
+
+@bot.listen("on_guild_channel_delete")
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    """Détecte quand un salon contenant un panel ou info-embed déployé est supprimé sur Discord."""
+    try:
+        async with AsyncSessionLocal() as session:
+            # 1. Panels
+            res = await session.execute(
+                select(Panel).where(Panel.deployed_channel_id == channel.id)
+            )
+            panels = res.scalars().all()
+            if panels:
+                for panel in panels:
+                    logger.info(f"[{INSTANCE_ID}] Salon #{channel.name} ({channel.id}) supprimé sur Discord. Panel '{panel.name}' réinitialisé.")
+                    panel.deployed_channel_id = None
+                    panel.deployed_message_id = None
+                await session.commit()
+
+            # 2. InfoEmbeds
+            res_ie = await session.execute(
+                select(InfoEmbed).where(InfoEmbed.channel_id == channel.id)
+            )
+            ies = res_ie.scalars().all()
+            if ies:
+                for ie in ies:
+                    logger.info(f"[{INSTANCE_ID}] Salon #{channel.name} ({channel.id}) supprimé sur Discord. Guide '{ie.key}' réinitialisé.")
+                    ie.channel_id = None
+                    ie.deployed_message_id = None
+                await session.commit()
+
+            # 3. Announcements
+            res_ann = await session.execute(
+                select(Announcement).where(Announcement.channel_id == channel.id)
+            )
+            anns = res_ann.scalars().all()
+            if anns:
+                for a in anns:
+                    logger.info(f"[{INSTANCE_ID}] Salon #{channel.name} ({channel.id}) supprimé sur Discord. Annonce '{a.title}' marquée supprimée.")
+                    a.status = "deleted"
+                    a.message_id = None
+                await session.commit()
+    except Exception as e:
+        logger.error(f"[{INSTANCE_ID}] Erreur dans on_guild_channel_delete: {e}")
+
 

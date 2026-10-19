@@ -11,11 +11,11 @@ from dotenv import load_dotenv
 import discord
 import datetime
 from sqlalchemy.future import select
-from sqlalchemy import func, text
+from sqlalchemy import func, text, delete, or_
 
-from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive
-from bot import bot, PanelView
-from schemas import PanelCreate, FieldCreate, BotProfileUpdate
+from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement
+from bot import bot, PanelView, build_panel_embed, build_info_embed, build_announcement_embed
+from schemas import PanelCreate, FieldCreate, BotProfileUpdate, InfoEmbedUpdate, AnnouncementCreate, AnnouncementUpdate
 from migrator import auto_migrate_db
 
 load_dotenv()
@@ -38,8 +38,17 @@ def panel_to_dict(p: Panel) -> dict:
         "id": p.id,
         "name": p.name,
         "embed_title": p.embed_title,
+        "embed_title_url": getattr(p, "embed_title_url", None) or "",
         "embed_description": p.embed_description,
         "embed_color": p.embed_color,
+        "embed_author_name": getattr(p, "embed_author_name", None) or "",
+        "embed_author_icon_url": getattr(p, "embed_author_icon_url", None) or "",
+        "embed_author_url": getattr(p, "embed_author_url", None) or "",
+        "embed_thumbnail_url": getattr(p, "embed_thumbnail_url", None) or "",
+        "embed_image_url": getattr(p, "embed_image_url", None) or "",
+        "embed_footer_text": getattr(p, "embed_footer_text", None) or "Système de Ticketing",
+        "embed_footer_icon_url": getattr(p, "embed_footer_icon_url", None) or "",
+        "embed_show_timestamp": bool(p.embed_show_timestamp) if getattr(p, "embed_show_timestamp", None) is not None else False,
         "button_text": p.button_text,
         "button_color": p.button_color,
         "button_emoji": p.button_emoji,
@@ -48,7 +57,12 @@ def panel_to_dict(p: Panel) -> dict:
         "ping_role_id": str(p.ping_role_id) if p.ping_role_id else None,
         "ping_creator": bool(p.ping_creator) if p.ping_creator is not None else True,
         "max_tickets_per_user": p.max_tickets_per_user if p.max_tickets_per_user is not None else 1,
+        "intro_embed_title": getattr(p, "intro_embed_title", None) or "Bienvenue dans votre ticket",
         "intro_message": p.intro_message,
+        "intro_embed_color": getattr(p, "intro_embed_color", None) or "",
+        "intro_thumbnail_url": getattr(p, "intro_thumbnail_url", None) or "",
+        "intro_image_url": getattr(p, "intro_image_url", None) or "",
+        "intro_footer_text": getattr(p, "intro_footer_text", None) or "",
         "inactivity_days": p.inactivity_days,
         "deployed_channel_id": str(p.deployed_channel_id) if p.deployed_channel_id else None,
         "deployed_message_id": str(p.deployed_message_id) if p.deployed_message_id else None,
@@ -67,6 +81,15 @@ def panel_to_dict(p: Panel) -> dict:
         "creator_can_close": bool(p.creator_can_close) if getattr(p, "creator_can_close", None) is not None else True,
         "creator_can_close_with_reason": bool(p.creator_can_close_with_reason) if getattr(p, "creator_can_close_with_reason", None) is not None else False,
         "dm_transcript_on_close": bool(p.dm_transcript_on_close) if getattr(p, "dm_transcript_on_close", None) is not None else True,
+        "dm_embed_title": getattr(p, "dm_embed_title", None) or "🔒 Ticket fermé — {ticket_name}",
+        "dm_embed_title_url": getattr(p, "dm_embed_title_url", None) or "",
+        "dm_embed_description": getattr(p, "dm_embed_description", None) or "Votre ticket **{ticket_name}** a été clôturé par **{closed_by}**.\nVous trouverez ci-joint l'archive complète de votre conversation.",
+        "dm_embed_color": getattr(p, "dm_embed_color", None) or "",
+        "dm_thumbnail_url": getattr(p, "dm_thumbnail_url", None) or "",
+        "dm_image_url": getattr(p, "dm_image_url", None) or "",
+        "dm_footer_text": getattr(p, "dm_footer_text", None) or "Téléchargez et ouvrez le fichier .html pour relire la conversation.",
+        "dm_footer_icon_url": getattr(p, "dm_footer_icon_url", None) or "",
+        "dm_show_timestamp": bool(p.dm_show_timestamp) if getattr(p, "dm_show_timestamp", None) is not None else True,
         "modal_title": getattr(p, "modal_title", None) or "",
     }
 
@@ -113,26 +136,114 @@ def ticket_to_dict(t: Ticket) -> dict:
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
 
+def info_embed_to_dict(ie: InfoEmbed) -> dict:
+    return {
+        "id": ie.id,
+        "key": ie.key,
+        "title": ie.title or "Comment vendre",
+        "channel_id": str(ie.channel_id) if ie.channel_id else "",
+        "deployed_message_id": str(ie.deployed_message_id) if ie.deployed_message_id else None,
+        "embed_title": ie.embed_title or "📖 Comment vendre votre collection ?",
+        "embed_title_url": getattr(ie, "embed_title_url", None) or "",
+        "embed_description": ie.embed_description or "",
+        "embed_color": ie.embed_color or "#5865F2",
+        "embed_author_name": getattr(ie, "embed_author_name", None) or "",
+        "embed_author_icon_url": getattr(ie, "embed_author_icon_url", None) or "",
+        "embed_author_url": getattr(ie, "embed_author_url", None) or "",
+        "embed_thumbnail_url": getattr(ie, "embed_thumbnail_url", None) or "",
+        "embed_image_url": getattr(ie, "embed_image_url", None) or "",
+        "embed_footer_text": getattr(ie, "embed_footer_text", None) or "BRB Collection • Guide Officiel",
+        "embed_footer_icon_url": getattr(ie, "embed_footer_icon_url", None) or "",
+        "embed_show_timestamp": bool(ie.embed_show_timestamp) if getattr(ie, "embed_show_timestamp", None) is not None else False,
+        "updated_at": ie.updated_at.isoformat() if ie.updated_at else None,
+    }
+
+def announcement_to_dict(ann: Announcement) -> dict:
+    return {
+        "id": ann.id,
+        "title": ann.title or "Nouvelle Annonce",
+        "channel_id": str(ann.channel_id) if ann.channel_id else "",
+        "message_id": str(ann.message_id) if ann.message_id else None,
+        "content": ann.content or "",
+        "embed_title": ann.embed_title or "",
+        "embed_title_url": ann.embed_title_url or "",
+        "embed_description": ann.embed_description or "",
+        "embed_color": ann.embed_color or "#5865F2",
+        "embed_author_name": ann.embed_author_name or "",
+        "embed_author_icon_url": ann.embed_author_icon_url or "",
+        "embed_author_url": ann.embed_author_url or "",
+        "embed_thumbnail_url": ann.embed_thumbnail_url or "",
+        "embed_image_url": ann.embed_image_url or "",
+        "embed_footer_text": ann.embed_footer_text or "",
+        "embed_footer_icon_url": ann.embed_footer_icon_url or "",
+        "embed_show_timestamp": bool(ann.embed_show_timestamp) if getattr(ann, "embed_show_timestamp", None) is not None else True,
+        "status": ann.status or "sent",
+        "created_at": ann.created_at.isoformat() if ann.created_at else None,
+        "updated_at": ann.updated_at.isoformat() if ann.updated_at else None,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Synchronisation automatique et sécurisée du schéma de la BDD (aucune perte de données)
-    await auto_migrate_db(engine, Base)
+    # Synchronisation automatique et sécurisée du schéma de la BDD avec retry
+    for attempt in range(1, 16):
+        try:
+            await auto_migrate_db(engine, Base)
+            break
+        except Exception as e:
+            if attempt == 15:
+                logger.error(f"[Startup] Impossible de se connecter à la DB après 15 tentatives: {e}")
+                raise
+            logger.warning(f"[Startup] Base de données pas encore prête (tentative {attempt}/15): {e}. Réessai dans 2s...")
+            await asyncio.sleep(2)
     
     # Création d'un Panel par défaut (WTB) si aucun n'existe
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Panel))
-        if not res.scalars().first():
-            session.add(Panel(
-                name="WTB",
-                embed_title="WTB",
-                embed_description="Vendre vos items / cartes",
-                embed_color="#2ecc71",
-                button_text="Proposer des articles",
-                button_color="success",
-                button_emoji="📦",
-                intro_message="Veuillez dans un premier temps nous lister tous vos items. Ensuite le staff reviendra vers vous rapidement.\nPour fermer le ticket appuyez sur close."
-            ))
-            await session.commit()
+    for attempt in range(1, 10):
+        try:
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(Panel))
+                if not res.scalars().first():
+                    session.add(Panel(
+                        name="WTB",
+                        embed_title="WTB",
+                        embed_description="Vendre vos items / cartes",
+                        embed_color="#2ecc71",
+                        button_text="Proposer des articles",
+                        button_color="success",
+                        button_emoji="📦",
+                        intro_message="Veuillez dans un premier temps nous lister tous vos items. Ensuite le staff reviendra vers vous rapidement.\nPour fermer le ticket appuyez sur close."
+                    ))
+                    await session.commit()
+            break
+        except Exception as e:
+            if attempt == 9:
+                logger.error(f"[Startup] Erreur création panel par défaut: {e}")
+                raise
+            await asyncio.sleep(2)
+
+    # Initialisation du message "Comment vendre" (InfoEmbed) par défaut si inexistant
+    for attempt in range(1, 10):
+        try:
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(InfoEmbed).where(InfoEmbed.key == "how_to_sell"))
+                if not res.scalars().first():
+                    session.add(InfoEmbed(
+                        key="how_to_sell",
+                        title="Comment vendre votre collection",
+                        embed_title="📖 Comment vendre votre collection ?",
+                        embed_title_url="",
+                        embed_description="Bienvenue chez **BRB Collection** !\n\nVoici les étapes pour nous vendre votre collection en toute sécurité :\n\n1️⃣ **Ouvrez un ticket** en cliquant sur le bouton dans notre salon dédié.\n2️⃣ **Remplissez le formulaire** en indiquant la liste de vos pièces et joignez vos photos.\n3️⃣ **Recevez notre offre** d'achat sous 24 à 48h ouvrées.\n4️⃣ **Expédition & Paiement** immédiat après réception et contrôle !\n\nPour en savoir plus, consultez notre [Site Web](https://monsite.com).",
+                        embed_color="#5865F2",
+                        embed_footer_text="BRB Collection • Guide Officiel",
+                        embed_show_timestamp=False
+                    ))
+                    await session.commit()
+            break
+        except Exception as e:
+            if attempt == 9:
+                logger.error(f"[Startup] Erreur création InfoEmbed par défaut: {e}")
+                raise
+            await asyncio.sleep(2)
             
     token = os.getenv("DISCORD_BOT_TOKEN")
     if token:
@@ -229,11 +340,578 @@ async def update_bot_profile(profile_data: BotProfileUpdate):
         logger.error(f"Erreur inattendue lors de l'édition du profil: {exc}")
         raise HTTPException(status_code=500, detail=f"Erreur serveur : {str(exc)}")
 
+
+# --- GUIDES & MESSAGES D'INFORMATION PERMANENTS (ex: FAQ, Règlement, Guides personnalisés...) ---
+async def _handle_get_all_info_embeds():
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(InfoEmbed).where(InfoEmbed.key != "how_to_sell").order_by(InfoEmbed.id.asc())
+        )
+        items = res.scalars().all()
+
+        # Vérification en arrière-plan de l'existence des messages sur Discord
+        if bot.is_ready():
+            for ie in items:
+                if ie.channel_id and ie.deployed_message_id:
+                    try:
+                        ch_id = int(str(ie.channel_id).strip())
+                        msg_id = int(str(ie.deployed_message_id).strip())
+                        ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                        if ch:
+                            await ch.fetch_message(msg_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        ie.deployed_message_id = None
+                        await session.commit()
+                    except Exception:
+                        pass
+        return [info_embed_to_dict(ie) for ie in items]
+
+@app.get("/api/info-embeds", dependencies=[Depends(get_api_key)])
+@app.get("/info-embeds", dependencies=[Depends(get_api_key)])
+async def get_all_info_embeds():
+    return await _handle_get_all_info_embeds()
+
+
+async def _handle_create_info_embed(data: InfoEmbedUpdate):
+    async with AsyncSessionLocal() as session:
+        import time, uuid
+        raw_key = (data.key or "").strip()
+        if not raw_key:
+            raw_key = f"guide_{int(time.time())}"
+        
+        existing = await session.execute(select(InfoEmbed).where(InfoEmbed.key == raw_key))
+        if existing.scalars().first():
+            raw_key = f"{raw_key}_{uuid.uuid4().hex[:6]}"
+
+        ie = InfoEmbed(key=raw_key)
+        session.add(ie)
+
+        fields_data = data.dict(exclude={"auto_deploy", "key"})
+        for field, value in fields_data.items():
+            if field == "channel_id":
+                if value and str(value).strip():
+                    try:
+                        ie.channel_id = int(str(value).strip())
+                    except (ValueError, TypeError):
+                        ie.channel_id = None
+                else:
+                    ie.channel_id = None
+            else:
+                setattr(ie, field, value)
+
+        await session.commit()
+        await session.refresh(ie)
+
+        deploy_status = None
+        if data.auto_deploy and ie.channel_id and bot.is_ready():
+            try:
+                embed = build_info_embed(ie)
+                target_channel = bot.get_channel(ie.channel_id) or await bot.fetch_channel(ie.channel_id)
+                if target_channel:
+                    new_msg = await target_channel.send(embed=embed)
+                    ie.deployed_message_id = new_msg.id
+                    deploy_status = "Guide déployé avec succès sur Discord !"
+                    await session.commit()
+            except Exception as e:
+                logger.error(f"Erreur déploiement nouveau guide: {e}")
+                deploy_status = f"Enregistré, mais erreur Discord : {str(e)}"
+
+        result = info_embed_to_dict(ie)
+        if deploy_status:
+            result["deploy_status"] = deploy_status
+        return result
+
+@app.post("/api/info-embeds", dependencies=[Depends(get_api_key)])
+@app.post("/info-embeds", dependencies=[Depends(get_api_key)])
+async def create_info_embed(data: InfoEmbedUpdate):
+    return await _handle_create_info_embed(data)
+
+
+async def _handle_get_info_embed(key_or_id: str):
+    async with AsyncSessionLocal() as session:
+        query = select(InfoEmbed).where(
+            or_(InfoEmbed.id == int(key_or_id), InfoEmbed.key == str(key_or_id))
+        ) if str(key_or_id).isdigit() else select(InfoEmbed).where(InfoEmbed.key == str(key_or_id))
+
+        res = await session.execute(query)
+        ie = res.scalars().first()
+        if not ie:
+            if str(key_or_id) == "how_to_sell":
+                ie = InfoEmbed(
+                    key="how_to_sell",
+                    title="Comment vendre votre collection",
+                    embed_title="📖 Comment vendre votre collection ?",
+                    embed_title_url="",
+                    embed_description="Bienvenue chez **BRB Collection** !\n\nVoici les étapes pour nous vendre votre collection en toute sécurité :\n\n1️⃣ **Ouvrez un ticket** en cliquant sur le bouton dans notre salon dédié.\n2️⃣ **Remplissez le formulaire** en indiquant la liste de vos pièces et joignez vos photos.\n3️⃣ **Recevez notre offre** d'achat sous 24 à 48h ouvrées.\n4️⃣ **Expédition & Paiement** immédiat après réception et contrôle !\n\nPour en savoir plus, consultez notre [Site Web](https://monsite.com).",
+                    embed_color="#5865F2",
+                    embed_footer_text="BRB Collection • Guide Officiel",
+                    embed_show_timestamp=False
+                )
+                session.add(ie)
+                await session.commit()
+                await session.refresh(ie)
+            else:
+                raise HTTPException(status_code=404, detail="Guide introuvable.")
+        
+        # Vérification en direct sur Discord
+        if bot.is_ready() and ie.channel_id and ie.deployed_message_id:
+            try:
+                ch_id = int(str(ie.channel_id).strip())
+                msg_id = int(str(ie.deployed_message_id).strip())
+                ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                if ch:
+                    await ch.fetch_message(msg_id)
+            except (discord.NotFound, discord.Forbidden):
+                logger.info(f"Le message guide '{ie.key}' ({ie.deployed_message_id}) n'existe plus sur Discord. Réinitialisation.")
+                ie.deployed_message_id = None
+                await session.commit()
+            except Exception as e:
+                logger.debug(f"Vérification message guide '{ie.key}' ignorée: {e}")
+        
+        return info_embed_to_dict(ie)
+
+@app.get("/api/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+@app.get("/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+async def get_info_embed(key: str):
+    return await _handle_get_info_embed(key)
+
+
+async def _handle_update_info_embed(key_or_id: str, data: InfoEmbedUpdate):
+    async with AsyncSessionLocal() as session:
+        query = select(InfoEmbed).where(
+            or_(InfoEmbed.id == int(key_or_id), InfoEmbed.key == str(key_or_id))
+        ) if str(key_or_id).isdigit() else select(InfoEmbed).where(InfoEmbed.key == str(key_or_id))
+
+        res = await session.execute(query)
+        ie = res.scalars().first()
+        if not ie:
+            if not str(key_or_id).isdigit():
+                ie = InfoEmbed(key=key_or_id)
+                session.add(ie)
+            else:
+                raise HTTPException(status_code=404, detail="Guide introuvable.")
+
+        old_channel_id = ie.channel_id
+        old_message_id = ie.deployed_message_id
+
+        # Mise à jour des champs
+        fields_data = data.dict(exclude={"auto_deploy", "key"})
+        for field, value in fields_data.items():
+            if field == "channel_id":
+                if value and str(value).strip():
+                    try:
+                        ie.channel_id = int(str(value).strip())
+                    except (ValueError, TypeError):
+                        ie.channel_id = None
+                else:
+                    ie.channel_id = None
+            else:
+                setattr(ie, field, value)
+
+        await session.commit()
+        await session.refresh(ie)
+
+        deploy_status = None
+        # Auto-déploiement ou mise à jour immédiate si un salon est spécifié
+        if data.auto_deploy and ie.channel_id and bot.is_ready():
+            try:
+                embed = build_info_embed(ie)
+                target_channel = bot.get_channel(ie.channel_id) or await bot.fetch_channel(ie.channel_id)
+
+                if target_channel:
+                    edited = False
+                    # Cas 1 : Même salon et message déjà déployé -> Édition du message existant !
+                    if old_message_id and old_channel_id == ie.channel_id:
+                        try:
+                            msg = await target_channel.fetch_message(old_message_id)
+                            if msg:
+                                await msg.edit(embed=embed)
+                                ie.deployed_message_id = msg.id
+                                edited = True
+                                deploy_status = "Message mis à jour avec succès sur Discord !"
+                                logger.info(f"Guide '{ie.key}' édité en direct sur message {msg.id}")
+                        except (discord.NotFound, discord.Forbidden):
+                            edited = False
+                    
+                    # Cas 2 : Changement de salon ou message non trouvé -> suppression ancien et envoi nouveau
+                    if not edited:
+                        if old_message_id and old_channel_id and old_channel_id != ie.channel_id:
+                            try:
+                                old_ch = bot.get_channel(old_channel_id) or await bot.fetch_channel(old_channel_id)
+                                if old_ch:
+                                    old_msg = await old_ch.fetch_message(old_message_id)
+                                    if old_msg:
+                                        await old_msg.delete()
+                            except Exception as e:
+                                logger.debug(f"Suppression ancien message guide ignorée: {e}")
+                        
+                        new_msg = await target_channel.send(embed=embed)
+                        ie.deployed_message_id = new_msg.id
+                        deploy_status = "Guide déployé avec succès sur Discord !"
+                        logger.info(f"Guide '{ie.key}' posté sur salon #{target_channel.name} ({new_msg.id})")
+                    
+                    await session.commit()
+            except Exception as e:
+                logger.error(f"Erreur lors du déploiement du guide '{ie.key}': {e}")
+                deploy_status = f"Enregistré, mais erreur Discord : {str(e)}"
+
+        result = info_embed_to_dict(ie)
+        if deploy_status:
+            result["deploy_status"] = deploy_status
+        return result
+
+@app.put("/api/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+@app.put("/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+async def update_info_embed(key: str, data: InfoEmbedUpdate):
+    return await _handle_update_info_embed(key, data)
+
+
+async def _handle_undeploy_info_embed(key_or_id: str):
+    async with AsyncSessionLocal() as session:
+        query = select(InfoEmbed).where(
+            or_(InfoEmbed.id == int(key_or_id), InfoEmbed.key == str(key_or_id))
+        ) if str(key_or_id).isdigit() else select(InfoEmbed).where(InfoEmbed.key == str(key_or_id))
+
+        res = await session.execute(query)
+        ie = res.scalars().first()
+        if not ie:
+            raise HTTPException(status_code=404, detail="Guide introuvable.")
+
+        if ie.channel_id and ie.deployed_message_id and bot.is_ready():
+            try:
+                ch = bot.get_channel(ie.channel_id) or await bot.fetch_channel(ie.channel_id)
+                if ch:
+                    msg = await ch.fetch_message(ie.deployed_message_id)
+                    if msg:
+                        await msg.delete()
+                        logger.info(f"Message Guide '{ie.key}' ({ie.deployed_message_id}) supprimé sur Discord.")
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except Exception as e:
+                logger.warning(f"Erreur suppression message Guide: {e}")
+
+        ie.deployed_message_id = None
+        await session.commit()
+        return info_embed_to_dict(ie)
+
+@app.post("/api/info-embeds/{key:path}/undeploy", dependencies=[Depends(get_api_key)])
+@app.post("/info-embeds/{key:path}/undeploy", dependencies=[Depends(get_api_key)])
+async def undeploy_info_embed(key: str):
+    return await _handle_undeploy_info_embed(key)
+
+
+async def _handle_delete_info_embed(key_or_id: str):
+    async with AsyncSessionLocal() as session:
+        query = select(InfoEmbed).where(
+            or_(InfoEmbed.id == int(key_or_id), InfoEmbed.key == str(key_or_id))
+        ) if str(key_or_id).isdigit() else select(InfoEmbed).where(InfoEmbed.key == str(key_or_id))
+
+        res = await session.execute(query)
+        ie = res.scalars().first()
+        if not ie:
+            raise HTTPException(status_code=404, detail="Guide introuvable.")
+
+        if ie.channel_id and ie.deployed_message_id and bot.is_ready():
+            try:
+                ch = bot.get_channel(ie.channel_id) or await bot.fetch_channel(ie.channel_id)
+                if ch:
+                    msg = await ch.fetch_message(ie.deployed_message_id)
+                    if msg:
+                        await msg.delete()
+                        logger.info(f"Message Guide '{ie.key}' supprimé sur Discord lors de la suppression.")
+            except Exception as e:
+                logger.warning(f"Erreur suppression message Discord guide: {e}")
+
+        await session.delete(ie)
+        await session.commit()
+        return {"success": True, "message": "Guide supprimé avec succès."}
+
+@app.delete("/api/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+@app.delete("/info-embeds/{key:path}", dependencies=[Depends(get_api_key)])
+async def delete_info_embed(key: str):
+    return await _handle_delete_info_embed(key)
+
+
+# --- ANNOUNCEMENTS (MODULE D'ANNONCES & DIFFUSION) ---
+
+async def _handle_get_announcements():
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(Announcement).order_by(Announcement.created_at.desc()))
+        announcements = res.scalars().all()
+        
+        # Vérification en arrière-plan de l'existence des messages sur Discord
+        if bot.is_ready():
+            db_changed = False
+            for ann in announcements:
+                if ann.channel_id and ann.message_id and ann.status != "deleted":
+                    try:
+                        ch_id = int(str(ann.channel_id).strip())
+                        msg_id = int(str(ann.message_id).strip())
+                        ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                        if ch:
+                            await ch.fetch_message(msg_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        ann.status = "deleted"
+                        ann.message_id = None
+                        db_changed = True
+                    except Exception:
+                        pass
+            if db_changed:
+                await session.commit()
+                
+        return [announcement_to_dict(a) for a in announcements]
+
+@app.get("/api/announcements", dependencies=[Depends(get_api_key)])
+@app.get("/announcements", dependencies=[Depends(get_api_key)])
+async def get_announcements():
+    return await _handle_get_announcements()
+
+
+async def _handle_get_announcement(ann_id: int):
+    async with AsyncSessionLocal() as session:
+        ann = await session.get(Announcement, ann_id)
+        if not ann:
+            raise HTTPException(404, detail="Annonce introuvable.")
+        
+        if bot.is_ready() and ann.channel_id and ann.message_id and ann.status != "deleted":
+            try:
+                ch_id = int(str(ann.channel_id).strip())
+                msg_id = int(str(ann.message_id).strip())
+                ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                if ch:
+                    await ch.fetch_message(msg_id)
+            except (discord.NotFound, discord.Forbidden):
+                ann.status = "deleted"
+                ann.message_id = None
+                await session.commit()
+            except Exception:
+                pass
+        return announcement_to_dict(ann)
+
+@app.get("/api/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+@app.get("/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+async def get_announcement(ann_id: int):
+    return await _handle_get_announcement(ann_id)
+
+
+async def _handle_create_announcement(data: AnnouncementCreate):
+    if not bot.is_ready():
+        raise HTTPException(503, detail="Le bot Discord n'est pas encore prêt. Veuillez patienter.")
+    
+    try:
+        ch_id = int(str(data.channel_id).strip())
+        channel = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+        if not channel:
+            raise HTTPException(404, detail=f"Salon Discord ID {ch_id} introuvable.")
+    except Exception as e:
+        raise HTTPException(400, detail=f"Salon Discord invalide: {e}")
+
+    embed = build_announcement_embed(data)
+    content_str = str(data.content).strip() if data.content and str(data.content).strip() else None
+
+    if not content_str and not embed:
+        raise HTTPException(400, detail="Veuillez renseigner un message texte ou au moins un élément d'embed (titre, description...).")
+
+    try:
+        send_kwargs = {}
+        if content_str:
+            send_kwargs["content"] = content_str
+        if embed:
+            send_kwargs["embed"] = embed
+        
+        msg = await channel.send(**send_kwargs)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'envoi de l'annonce sur Discord: {e}")
+        raise HTTPException(500, detail=f"Erreur lors de l'envoi sur Discord: {e}")
+
+    async with AsyncSessionLocal() as session:
+        ann = Announcement(
+            title=str(data.title).strip() if data.title else "Nouvelle Annonce",
+            channel_id=ch_id,
+            message_id=msg.id,
+            content=content_str,
+            embed_title=data.embed_title,
+            embed_title_url=data.embed_title_url,
+            embed_description=data.embed_description,
+            embed_color=data.embed_color or "#5865F2",
+            embed_author_name=data.embed_author_name,
+            embed_author_icon_url=data.embed_author_icon_url,
+            embed_author_url=data.embed_author_url,
+            embed_thumbnail_url=data.embed_thumbnail_url,
+            embed_image_url=data.embed_image_url,
+            embed_footer_text=data.embed_footer_text,
+            embed_footer_icon_url=data.embed_footer_icon_url,
+            embed_show_timestamp=bool(data.embed_show_timestamp) if data.embed_show_timestamp is not None else True,
+            status="sent",
+            created_at=datetime.datetime.utcnow(),
+            updated_at=datetime.datetime.utcnow(),
+        )
+        session.add(ann)
+        await session.commit()
+        await session.refresh(ann)
+        return announcement_to_dict(ann)
+
+@app.post("/api/announcements", dependencies=[Depends(get_api_key)])
+@app.post("/announcements", dependencies=[Depends(get_api_key)])
+async def create_announcement(data: AnnouncementCreate):
+    return await _handle_create_announcement(data)
+
+
+async def _handle_update_announcement(ann_id: int, data: AnnouncementUpdate):
+    if not bot.is_ready():
+        raise HTTPException(503, detail="Le bot Discord n'est pas encore prêt. Veuillez patienter.")
+
+    async with AsyncSessionLocal() as session:
+        ann = await session.get(Announcement, ann_id)
+        if not ann:
+            raise HTTPException(404, detail="Annonce introuvable.")
+
+        # Mise à jour des attributs si fournis
+        if data.title is not None: ann.title = str(data.title).strip()
+        if data.content is not None: ann.content = str(data.content).strip() if str(data.content).strip() else None
+        if data.embed_title is not None: ann.embed_title = data.embed_title
+        if data.embed_title_url is not None: ann.embed_title_url = data.embed_title_url
+        if data.embed_description is not None: ann.embed_description = data.embed_description
+        if data.embed_color is not None: ann.embed_color = data.embed_color
+        if data.embed_author_name is not None: ann.embed_author_name = data.embed_author_name
+        if data.embed_author_icon_url is not None: ann.embed_author_icon_url = data.embed_author_icon_url
+        if data.embed_author_url is not None: ann.embed_author_url = data.embed_author_url
+        if data.embed_thumbnail_url is not None: ann.embed_thumbnail_url = data.embed_thumbnail_url
+        if data.embed_image_url is not None: ann.embed_image_url = data.embed_image_url
+        if data.embed_footer_text is not None: ann.embed_footer_text = data.embed_footer_text
+        if data.embed_footer_icon_url is not None: ann.embed_footer_icon_url = data.embed_footer_icon_url
+        if data.embed_show_timestamp is not None: ann.embed_show_timestamp = bool(data.embed_show_timestamp)
+
+        old_channel_id = ann.channel_id
+        new_channel_id = int(str(data.channel_id).strip()) if data.channel_id and str(data.channel_id).strip() else old_channel_id
+
+        embed = build_announcement_embed(ann)
+        content_str = ann.content if ann.content and str(ann.content).strip() else None
+
+        # Cas 1 : Le salon a changé -> Supprime l'ancien message et reposte dans le nouveau salon
+        if new_channel_id != old_channel_id:
+            # Supprime l'ancien
+            if old_channel_id and ann.message_id:
+                try:
+                    old_ch = bot.get_channel(old_channel_id) or await bot.fetch_channel(old_channel_id)
+                    if old_ch:
+                        old_msg = await old_ch.fetch_message(ann.message_id)
+                        if old_msg:
+                            await old_msg.delete()
+                except Exception as e:
+                    logger.warning(f"Impossible de supprimer l'ancien message d'annonce: {e}")
+
+            # Envoie dans le nouveau salon
+            try:
+                new_ch = bot.get_channel(new_channel_id) or await bot.fetch_channel(new_channel_id)
+                send_kwargs = {}
+                if content_str: send_kwargs["content"] = content_str
+                if embed: send_kwargs["embed"] = embed
+                new_msg = await new_ch.send(**send_kwargs)
+                ann.channel_id = new_channel_id
+                ann.message_id = new_msg.id
+                ann.status = "sent"
+            except Exception as e:
+                logger.error(f"Erreur lors de la diffusion de l'annonce dans le nouveau salon: {e}")
+                raise HTTPException(500, detail=f"Erreur lors de la publication dans le nouveau salon: {e}")
+
+        # Cas 2 : Le salon reste le même -> Modifie le message en place
+        else:
+            edited = False
+            if ann.channel_id and ann.message_id:
+                try:
+                    ch = bot.get_channel(ann.channel_id) or await bot.fetch_channel(ann.channel_id)
+                    if ch:
+                        msg = await ch.fetch_message(ann.message_id)
+                        if msg:
+                            edit_kwargs = {
+                                "content": content_str,
+                                "embed": embed
+                            }
+                            await msg.edit(**edit_kwargs)
+                            edited = True
+                            ann.status = "edited"
+                except Exception as e:
+                    logger.warning(f"Impossible d'éditer le message {ann.message_id} sur Discord: {e}")
+
+            if not edited:
+                # Si le message d'origine n'existait plus, on le reposte
+                try:
+                    ch = bot.get_channel(ann.channel_id) or await bot.fetch_channel(ann.channel_id)
+                    send_kwargs = {}
+                    if content_str: send_kwargs["content"] = content_str
+                    if embed: send_kwargs["embed"] = embed
+                    new_msg = await ch.send(**send_kwargs)
+                    ann.message_id = new_msg.id
+                    ann.status = "sent"
+                except Exception as e:
+                    raise HTTPException(500, detail=f"Erreur ré-envoi annonce: {e}")
+
+        ann.updated_at = datetime.datetime.utcnow()
+        await session.commit()
+        await session.refresh(ann)
+        return announcement_to_dict(ann)
+
+@app.put("/api/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+@app.put("/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+async def update_announcement(ann_id: int, data: AnnouncementUpdate):
+    return await _handle_update_announcement(ann_id, data)
+
+
+async def _handle_delete_announcement(ann_id: int):
+    async with AsyncSessionLocal() as session:
+        ann = await session.get(Announcement, ann_id)
+        if not ann:
+            raise HTTPException(404, detail="Annonce introuvable.")
+
+        # Suppression du message sur Discord
+        if bot.is_ready() and ann.channel_id and ann.message_id:
+            try:
+                ch = bot.get_channel(ann.channel_id) or await bot.fetch_channel(ann.channel_id)
+                if ch:
+                    msg = await ch.fetch_message(ann.message_id)
+                    if msg:
+                        await msg.delete()
+                        logger.info(f"Message d'annonce {ann.message_id} supprimé sur Discord.")
+            except Exception as e:
+                logger.warning(f"Impossible de supprimer le message Discord {ann.message_id}: {e}")
+
+        await session.delete(ann)
+        await session.commit()
+        return {"success": True, "message": "Annonce supprimée avec succès."}
+
+@app.delete("/api/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+@app.delete("/announcements/{ann_id}", dependencies=[Depends(get_api_key)])
+async def delete_announcement(ann_id: int):
+    return await _handle_delete_announcement(ann_id)
+
+
 @app.get("/api/panels", dependencies=[Depends(get_api_key)])
 async def get_panels():
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Panel))
-        return [panel_to_dict(p) for p in res.scalars().all()]
+        res = await session.execute(select(Panel).order_by(Panel.id.asc()))
+        panels = res.scalars().all()
+        db_changed = False
+        if bot.is_ready():
+            for p in panels:
+                if p.deployed_channel_id and p.deployed_message_id:
+                    try:
+                        ch_id = int(str(p.deployed_channel_id).strip())
+                        msg_id = int(str(p.deployed_message_id).strip())
+                        ch = bot.get_channel(ch_id)
+                        if not ch:
+                            ch = await bot.fetch_channel(ch_id)
+                        await ch.fetch_message(msg_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        logger.info(f"Le message déployé {p.deployed_message_id} du panel '{p.name}' n'existe plus sur Discord. Réinitialisation du statut.")
+                        p.deployed_channel_id = None
+                        p.deployed_message_id = None
+                        db_changed = True
+                    except Exception as e:
+                        logger.debug(f"Vérification message panel {p.id} ignorée: {e}")
+            if db_changed:
+                await session.commit()
+        return [panel_to_dict(p) for p in panels]
 
 @app.post("/api/panels", dependencies=[Depends(get_api_key)])
 async def create_panel(panel_data: PanelCreate):
@@ -241,12 +919,26 @@ async def create_panel(panel_data: PanelCreate):
         panel = Panel(
             name=panel_data.name,
             embed_title=panel_data.embed_title,
+            embed_title_url=panel_data.embed_title_url,
             embed_description=panel_data.embed_description,
             embed_color=panel_data.embed_color,
+            embed_author_name=panel_data.embed_author_name,
+            embed_author_icon_url=panel_data.embed_author_icon_url,
+            embed_author_url=panel_data.embed_author_url,
+            embed_thumbnail_url=panel_data.embed_thumbnail_url,
+            embed_image_url=panel_data.embed_image_url,
+            embed_footer_text=panel_data.embed_footer_text or "Système de Ticketing",
+            embed_footer_icon_url=panel_data.embed_footer_icon_url,
+            embed_show_timestamp=panel_data.embed_show_timestamp if panel_data.embed_show_timestamp is not None else False,
             button_text=panel_data.button_text,
             button_color=panel_data.button_color,
             button_emoji=panel_data.button_emoji,
+            intro_embed_title=panel_data.intro_embed_title or "Bienvenue dans votre ticket",
             intro_message=panel_data.intro_message,
+            intro_embed_color=panel_data.intro_embed_color,
+            intro_thumbnail_url=panel_data.intro_thumbnail_url,
+            intro_image_url=panel_data.intro_image_url,
+            intro_footer_text=panel_data.intro_footer_text,
             inactivity_days=panel_data.inactivity_days,
             ping_creator=panel_data.ping_creator,
             max_tickets_per_user=panel_data.max_tickets_per_user,
@@ -265,6 +957,15 @@ async def create_panel(panel_data: PanelCreate):
             creator_can_close=panel_data.creator_can_close if panel_data.creator_can_close is not None else True,
             creator_can_close_with_reason=panel_data.creator_can_close_with_reason if panel_data.creator_can_close_with_reason is not None else False,
             dm_transcript_on_close=panel_data.dm_transcript_on_close if panel_data.dm_transcript_on_close is not None else True,
+            dm_embed_title=panel_data.dm_embed_title or "🔒 Ticket fermé — {ticket_name}",
+            dm_embed_title_url=panel_data.dm_embed_title_url,
+            dm_embed_description=panel_data.dm_embed_description or "Votre ticket **{ticket_name}** a été clôturé par **{closed_by}**.\nVous trouverez ci-joint l'archive complète de votre conversation.",
+            dm_embed_color=panel_data.dm_embed_color,
+            dm_thumbnail_url=panel_data.dm_thumbnail_url,
+            dm_image_url=panel_data.dm_image_url,
+            dm_footer_text=panel_data.dm_footer_text or "Téléchargez et ouvrez le fichier .html pour relire la conversation.",
+            dm_footer_icon_url=panel_data.dm_footer_icon_url,
+            dm_show_timestamp=panel_data.dm_show_timestamp if panel_data.dm_show_timestamp is not None else True,
             modal_title=panel_data.modal_title,
         )
         if panel_data.active_category_id and str(panel_data.active_category_id).strip():
@@ -312,19 +1013,22 @@ async def update_panel(panel_id: int, panel_data: PanelCreate):
         # 🚀 REDÉPLOIEMENT AUTOMATIQUE si le panel est déjà déployé sur un salon
         if panel.deployed_channel_id and panel.deployed_message_id:
             try:
-                ch = bot.get_channel(panel.deployed_channel_id) or await bot.fetch_channel(panel.deployed_channel_id)
+                ch_id = int(str(panel.deployed_channel_id).strip())
+                msg_id = int(str(panel.deployed_message_id).strip())
+                ch = bot.get_channel(ch_id)
+                if not ch:
+                    ch = await bot.fetch_channel(ch_id)
                 if ch:
-                    msg = await ch.fetch_message(panel.deployed_message_id)
+                    msg = await ch.fetch_message(msg_id)
                     if msg:
-                        color_int = int(panel.embed_color.lstrip('#'), 16) if panel.embed_color else 0x2ecc71
-                        embed = discord.Embed(
-                            title=panel.embed_title,
-                            description=panel.embed_description,
-                            color=discord.Color(color_int)
-                        )
-                        embed.set_footer(text="Système de Ticketing")
+                        embed = build_panel_embed(panel)
                         await msg.edit(embed=embed, view=PanelView(panel))
-                        logger.info(f"Panel {panel.id} auto-redéployé sur message {panel.deployed_message_id}")
+                        logger.info(f"Panel {panel.id} auto-redéployé sur message {msg_id}")
+            except (discord.NotFound, discord.Forbidden):
+                logger.info(f"Le message {panel.deployed_message_id} n'existe plus sur Discord. Réinitialisation du statut.")
+                panel.deployed_channel_id = None
+                panel.deployed_message_id = None
+                await session.commit()
             except Exception as e:
                 logger.warning(f"Impossible d'auto-redéployer le panel {panel.id}: {e}")
 
@@ -338,14 +1042,51 @@ async def delete_panel(panel_id: int):
             # Supprime aussi le message déployé sur Discord pour ne pas laisser de bouton orphelin
             if panel.deployed_channel_id and panel.deployed_message_id:
                 try:
-                    ch = bot.get_channel(panel.deployed_channel_id) or await bot.fetch_channel(panel.deployed_channel_id)
-                    msg = await ch.fetch_message(panel.deployed_message_id)
-                    await msg.delete()
+                    ch_id = int(str(panel.deployed_channel_id).strip())
+                    msg_id = int(str(panel.deployed_message_id).strip())
+                    ch = bot.get_channel(ch_id)
+                    if not ch:
+                        ch = await bot.fetch_channel(ch_id)
+                    if ch:
+                        msg = await ch.fetch_message(msg_id)
+                        if msg:
+                            await msg.delete()
+                            logger.info(f"Message Discord {msg_id} du panel {panel_id} supprimé avec succès.")
+                except (discord.NotFound, discord.Forbidden):
+                    logger.info(f"Le message du panel {panel_id} n'existait déjà plus sur Discord.")
                 except Exception as e:
                     logger.warning(f"Impossible de supprimer le message déployé du panel {panel_id}: {e}")
+            await session.execute(delete(FormField).where(FormField.panel_id == panel_id))
             await session.delete(panel)
             await session.commit()
         return {"success": True}
+
+@app.post("/api/panels/{panel_id}/undeploy", dependencies=[Depends(get_api_key)])
+async def undeploy_panel(panel_id: int):
+    async with AsyncSessionLocal() as session:
+        panel = await session.get(Panel, panel_id)
+        if not panel:
+            raise HTTPException(status_code=404, detail="Panel introuvable.")
+        if panel.deployed_channel_id and panel.deployed_message_id:
+            try:
+                ch_id = int(str(panel.deployed_channel_id).strip())
+                msg_id = int(str(panel.deployed_message_id).strip())
+                ch = bot.get_channel(ch_id)
+                if not ch:
+                    ch = await bot.fetch_channel(ch_id)
+                if ch:
+                    msg = await ch.fetch_message(msg_id)
+                    if msg:
+                        await msg.delete()
+                        logger.info(f"Message Discord {msg_id} du panel {panel_id} retiré.")
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except Exception as e:
+                logger.warning(f"Erreur lors du retrait du message Discord: {e}")
+            panel.deployed_channel_id = None
+            panel.deployed_message_id = None
+            await session.commit()
+        return {"success": True, "message": "Panel retiré de Discord."}
 
 @app.post("/api/panels/{panel_id}/send", dependencies=[Depends(get_api_key)])
 async def send_panel_to_discord(panel_id: int, channel_id: int):
@@ -354,18 +1095,32 @@ async def send_panel_to_discord(panel_id: int, channel_id: int):
         if not panel:
             raise HTTPException(status_code=404, detail="Panel introuvable.")
         
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        target_ch_id = int(str(channel_id).strip())
+        channel = bot.get_channel(target_ch_id)
+        if not channel:
+            channel = await bot.fetch_channel(target_ch_id)
         if not channel:
             raise HTTPException(status_code=404, detail="Salon Discord introuvable.")
         
-        color_int = int(panel.embed_color.lstrip('#'), 16) if panel.embed_color else 0x2ecc71
-        embed = discord.Embed(
-            title=panel.embed_title, 
-            description=panel.embed_description, 
-            color=discord.Color(color_int)
-        )
-        embed.set_footer(text="Système de Ticketing")
+        # Nettoyage de l'ancien message déployé pour éviter les doublons sur le serveur
+        if panel.deployed_channel_id and panel.deployed_message_id:
+            try:
+                old_ch_id = int(str(panel.deployed_channel_id).strip())
+                old_msg_id = int(str(panel.deployed_message_id).strip())
+                old_ch = bot.get_channel(old_ch_id)
+                if not old_ch:
+                    old_ch = await bot.fetch_channel(old_ch_id)
+                if old_ch:
+                    old_msg = await old_ch.fetch_message(old_msg_id)
+                    if old_msg:
+                        await old_msg.delete()
+                        logger.info(f"Ancien message {old_msg_id} du panel {panel_id} nettoyé avant redéploiement.")
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except Exception as e:
+                logger.debug(f"Nettoyage ancien message panel {panel_id}: {e}")
         
+        embed = build_panel_embed(panel)
         sent_msg = await channel.send(embed=embed, view=PanelView(panel))
         
         # Enregistrer l'emplacement du déploiement pour permettre les mises à jour automatiques
@@ -706,6 +1461,6 @@ async def get_archive(ticket_id: int):
         raise HTTPException(404, detail="Aucune archive disponible.")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, reload_excludes=[".git", ".git/*", "*.log"])
 
 
