@@ -132,6 +132,17 @@ EXPLICIT_MIGRATIONS = [
         created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
     )""",
+
+    # Table bot_settings (paramètres globaux : logs des tickets)
+    """CREATE TABLE IF NOT EXISTS bot_settings (
+        id SERIAL PRIMARY KEY,
+        key VARCHAR UNIQUE DEFAULT 'global',
+        logs_enabled BOOLEAN DEFAULT FALSE,
+        logs_channel_id BIGINT,
+        updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS logs_enabled BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS logs_channel_id BIGINT",
 ]
 
 

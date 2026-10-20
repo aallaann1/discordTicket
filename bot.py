@@ -11,7 +11,7 @@ import re
 from typing import Optional
 from sqlalchemy.future import select
 from sqlalchemy import func
-from database import AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement
+from database import AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement, BotSettings
 
 logger = logging.getLogger(__name__)
 
@@ -574,51 +574,279 @@ async def send_custom_modal(interaction: discord.Interaction, panel: Panel, fiel
             raise
 
 
-async def process_ticket_creation(
-    interaction: discord.Interaction,
-    panel: Panel,
-    answers_dict: dict,
-    uploaded_attachments: Optional[list] = None,
+MAX_CATEGORY_CHANNELS = 50
+
+
+async def get_base_category(
+    guild: discord.Guild,
+    base_category_id,
+    bot_client: Optional[discord.Client] = None,
+) -> Optional[discord.CategoryChannel]:
+    """Récupère la catégorie principale configurée par son ID."""
+    if not guild or not base_category_id:
+        return None
+    try:
+        cat_id = int(str(base_category_id).strip())
+        if cat_id <= 0:
+            return None
+        cat = guild.get_channel(cat_id) or discord.utils.get(guild.categories, id=cat_id)
+        if not cat and bot_client:
+            try:
+                fetched = await bot_client.fetch_channel(cat_id)
+                if isinstance(fetched, discord.CategoryChannel):
+                    cat = fetched
+            except Exception as e:
+                logger.warning(f"Impossible de fetch la catégorie {cat_id}: {e}")
+        return cat if isinstance(cat, discord.CategoryChannel) else None
+    except Exception as e:
+        logger.error(f"Erreur get_base_category({base_category_id}): {e}")
+        return None
+
+
+def get_overflow_categories_for_base(
+    guild: discord.Guild,
+    base_cat: discord.CategoryChannel,
+) -> list:
+    """
+    Retourne la liste triée [(num, category), ...] des catégories de débordement
+    associées à `base_cat` (ex: 'ticket (2)', 'ticket (3)', 'archive 2', 'archive (2)').
+    """
+    if not guild or not base_cat:
+        return []
+    base_name = base_cat.name.strip()
+    pattern = re.compile(
+        rf"^{re.escape(base_name)}\s*(?:\((\d+)\)|(\d+))$",
+        re.IGNORECASE,
+    )
+    overflows = []
+    for cat in guild.categories:
+        if cat.id == base_cat.id:
+            continue
+        m = pattern.match(cat.name.strip())
+        if m:
+            num_str = m.group(1) or m.group(2)
+            try:
+                num = int(num_str)
+                if num >= 2:
+                    overflows.append((num, cat))
+            except ValueError:
+                pass
+    overflows.sort(key=lambda x: (x[0], x[1].id))
+    return overflows
+
+
+async def create_overflow_category(
+    guild: discord.Guild,
+    base_cat: discord.CategoryChannel,
+    next_num: int,
+) -> discord.CategoryChannel:
+    """Crée une catégorie de débordement `Nom (N)` avec exactement les mêmes permissions que `base_cat`."""
+    new_name = f"{base_cat.name.strip()} ({next_num})"
+    overwrites_copy = dict(base_cat.overwrites) if base_cat.overwrites else {}
+    new_cat = await guild.create_category(
+        name=new_name[:100],
+        overwrites=overwrites_copy,
+        reason=f"Débordement automatique (> {MAX_CATEGORY_CHANNELS} salons dans {base_cat.name})",
+    )
+    logger.info(f"✨ Catégorie de débordement créée : '{new_cat.name}' (ID: {new_cat.id}) avec les mêmes droits que '{base_cat.name}'.")
+    return new_cat
+
+
+async def resolve_category_with_overflow(
+    guild: discord.Guild,
+    base_category_id,
+    bot_client: Optional[discord.Client] = None,
+) -> tuple:
+    """
+    Résout la catégorie cible où placer un salon.
+    Si la catégorie principale a < 50 salons, la retourne.
+    Sinon, cherche ou crée `Nom (2)`, `Nom (3)`, etc. avec exactement les mêmes droits.
+    Retourne `(target_category, base_category)`.
+    """
+    base_cat = await get_base_category(guild, base_category_id, bot_client)
+    if not base_cat:
+        return None, None
+
+    if len(base_cat.channels) < MAX_CATEGORY_CHANNELS:
+        return base_cat, base_cat
+
+    overflows = get_overflow_categories_for_base(guild, base_cat)
+    for num, o_cat in overflows:
+        if len(o_cat.channels) < MAX_CATEGORY_CHANNELS:
+            return o_cat, base_cat
+
+    existing_nums = {num for num, _ in overflows}
+    next_num = 2
+    while next_num in existing_nums:
+        next_num += 1
+
+    new_cat = await create_overflow_category(guild, base_cat, next_num)
+    return new_cat, base_cat
+
+
+async def move_channel_with_overflow(
+    channel: discord.TextChannel,
+    base_category_id,
+    bot_client: Optional[discord.Client] = None,
+) -> Optional[discord.CategoryChannel]:
+    """
+    Déplace un salon existant vers `base_category_id` (ou sa catégorie de débordement `Nom (2)`, etc.).
+    Gère aussi le cas où le cache Discord n'était pas à jour et que Discord renvoie le code 30052.
+    """
+    if not channel or not channel.guild or not base_category_id:
+        return None
+    guild = channel.guild
+    target_cat, base_cat = await resolve_category_with_overflow(guild, base_category_id, bot_client)
+    if not target_cat:
+        return None
+    if channel.category_id == target_cat.id:
+        return target_cat
+    try:
+        await channel.edit(category=target_cat)
+        return target_cat
+    except discord.HTTPException as e:
+        if (getattr(e, "code", None) == 30052 or "Maximum number of channels in category reached" in str(e)) and base_cat:
+            overflows = get_overflow_categories_for_base(guild, base_cat)
+            existing_nums = {num for num, _ in overflows}
+            next_num = 2
+            while next_num in existing_nums:
+                next_num += 1
+            new_cat = await create_overflow_category(guild, base_cat, next_num)
+            await channel.edit(category=new_cat)
+            return new_cat
+        raise
+
+
+async def create_ticket_channel_with_overflow(
+    guild: discord.Guild,
+    channel_name: str,
+    base_category_id,
+    overwrites: dict,
+    bot_client: Optional[discord.Client] = None,
+) -> discord.TextChannel:
+    """
+    Crée un salon textuel dans la catégorie configurée (ou dans `Nom (2)` si pleine).
+    Gère aussi le fallback si Discord renvoie 30052 (catégorie pleine côté serveur).
+    """
+    target_cat, base_cat = await resolve_category_with_overflow(guild, base_category_id, bot_client)
+    try:
+        return await guild.create_text_channel(
+            name=channel_name,
+            category=target_cat,
+            overwrites=overwrites,
+        )
+    except discord.HTTPException as e:
+        if (getattr(e, "code", None) == 30052 or "Maximum number of channels in category reached" in str(e)) and base_cat:
+            overflows = get_overflow_categories_for_base(guild, base_cat)
+            existing_nums = {num for num, _ in overflows}
+            next_num = 2
+            while next_num in existing_nums:
+                next_num += 1
+            new_cat = await create_overflow_category(guild, base_cat, next_num)
+            return await guild.create_text_channel(
+                name=channel_name,
+                category=new_cat,
+                overwrites=overwrites,
+            )
+        raise
+
+
+async def cleanup_and_rebalance_category_family(
+    guild: discord.Guild,
+    base_category_id,
+    bot_client: Optional[discord.Client] = None,
 ):
-    """Crée le salon de ticket, enregistre le ticket en BDD et envoie l'embed récapitulatif (+ fichiers uploadés)."""
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
+    """
+    Rééquilibre les salons entre la catégorie principale et ses catégories de débordement (`Nom (2)`, `Nom (3)`...).
+    Si la catégorie principale (ou une catégorie précédente) a moins de 50 salons, rapatrie les salons
+    depuis la dernière catégorie de débordement, puis supprime toute catégorie de débordement devenue vide.
+    """
+    base_cat = await get_base_category(guild, base_category_id, bot_client)
+    if not base_cat:
+        return
 
-    # 1. Résolution de la catégorie active
-    category = None
-    if panel.active_category_id:
-        try:
-            cat_id = int(str(panel.active_category_id).strip())
-            if cat_id > 0:
-                category = guild.get_channel(cat_id) or discord.utils.get(guild.categories, id=cat_id)
-                if not category:
-                    try:
-                        category = await interaction.client.fetch_channel(cat_id)
-                    except Exception as e:
-                        logger.warning(f"Impossible de fetch la catégorie {cat_id}: {e}")
-        except Exception as e:
-            logger.error(f"Erreur avec active_category_id: {e}")
+    overflows = get_overflow_categories_for_base(guild, base_cat)
+    if not overflows:
+        return
 
-    # Permissions : Héritage des permissions de la catégorie (pour que le Staff y ait accès quoi qu'il arrive)
+    all_cats = [base_cat] + [cat for _, cat in overflows]
+
+    # 1. Rapatrier les salons des catégories de débordement vers les catégories précédentes ayant de la place
+    for idx_dest, dest_cat in enumerate(all_cats[:-1]):
+        while len(dest_cat.channels) < MAX_CATEGORY_CHANNELS:
+            src_cat = None
+            for candidate in reversed(all_cats[idx_dest + 1:]):
+                if len(candidate.channels) > 0:
+                    src_cat = candidate
+                    break
+            if not src_cat:
+                break
+            ch_to_move = src_cat.channels[0]
+            try:
+                await ch_to_move.edit(
+                    category=dest_cat,
+                    reason=f"Rééquilibrage automatique vers {dest_cat.name} (< {MAX_CATEGORY_CHANNELS} salons)",
+                )
+            except Exception as move_err:
+                logger.warning(f"Impossible de rapatrier le salon #{ch_to_move.name} vers {dest_cat.name}: {move_err}")
+                break
+
+    # 2. Supprimer toutes les catégories de débordement qui sont désormais vides (0 salon)
+    overflows_after = get_overflow_categories_for_base(guild, base_cat)
+    for num, o_cat in reversed(overflows_after):
+        if len(o_cat.channels) == 0:
+            try:
+                cat_name = o_cat.name
+                await o_cat.delete(reason=f"Suppression automatique de la catégorie de débordement vide {cat_name}")
+                logger.info(f"🗑️ Catégorie de débordement supprimée car vide : {cat_name}")
+            except Exception as del_err:
+                logger.warning(f"Impossible de supprimer la catégorie de débordement vide {o_cat.name}: {del_err}")
+
+
+async def build_ticket_channel_overwrites(
+    guild: discord.Guild,
+    base_cat: Optional[discord.CategoryChannel],
+    creator_id: Optional[int],
+    panel: Optional[Panel],
+) -> tuple:
+    """
+    Construit le dictionnaire `overwrites` exact pour un salon de ticket :
+    - Héritage des permissions de la catégorie active (Staff)
+    - @everyone refusé
+    - Créateur autorisé (lecture, écriture, fichiers, liens)
+    - Bot autorisé
+    - Rôle staff du panel (`ping_role_id`) autorisé
+    """
     overwrites = {}
-    if category and category.overwrites:
-        for target, ow in category.overwrites.items():
+    if base_cat and base_cat.overwrites:
+        for target, ow in base_cat.overwrites.items():
             overwrites[target] = ow
 
-    # @everyone n'a JAMAIS accès au ticket
     overwrites[guild.default_role] = discord.PermissionOverwrite(read_messages=False)
-    # Seul le membre créateur a accès
-    overwrites[interaction.user] = discord.PermissionOverwrite(
-        read_messages=True, send_messages=True, attach_files=True, embed_links=True
-    )
-    # Le bot conserve les droits complets
-    overwrites[guild.me] = discord.PermissionOverwrite(
-        read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True
-    )
 
-    # Si un rôle staff est configuré sur le panel, on lui garantit explicitement l'accès
-    if panel.ping_role_id:
+    creator_member = None
+    if creator_id:
+        try:
+            cid = int(creator_id)
+            creator_member = guild.get_member(cid)
+            if not creator_member:
+                try:
+                    creator_member = await guild.fetch_member(cid)
+                except Exception:
+                    creator_member = None
+            if creator_member:
+                overwrites[creator_member] = discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True, attach_files=True, embed_links=True
+                )
+        except Exception:
+            pass
+
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True
+        )
+
+    if panel and panel.ping_role_id:
         try:
             r_id = int(str(panel.ping_role_id).strip())
             role = guild.get_role(r_id)
@@ -628,6 +856,101 @@ async def process_ticket_creation(
                 )
         except Exception:
             pass
+
+    return overwrites, creator_member
+
+
+def build_ticket_welcome_embed_and_pings(
+    panel: Optional[Panel],
+    ticket_id: int,
+    ticket_name: str,
+    creator_id: Optional[int],
+    answers_dict: Optional[dict],
+) -> tuple:
+    """Construit l'embed d'accueil du ticket avec ses réponses et les mentions configurées."""
+    intro_color_hex = (getattr(panel, "intro_embed_color", None) or getattr(panel, "embed_color", None)) if panel else None
+    try:
+        color_int = int(str(intro_color_hex).lstrip('#'), 16) if intro_color_hex else 0x2ecc71
+    except Exception:
+        color_int = 0x2ecc71
+
+    intro_title = ((getattr(panel, "intro_embed_title", None) if panel else None) or "Bienvenue dans votre ticket").strip()
+    intro_desc = (panel.intro_message if panel and panel.intro_message else "Bienvenue dans votre ticket !")
+    embed = discord.Embed(
+        title=intro_title[:256] if intro_title else None,
+        description=intro_desc,
+        color=discord.Color(color_int),
+    )
+
+    if panel:
+        intro_thumb = str(getattr(panel, "intro_thumbnail_url", "") or "").strip()
+        if intro_thumb and (intro_thumb.startswith("http://") or intro_thumb.startswith("https://")):
+            embed.set_thumbnail(url=intro_thumb)
+
+        intro_img = str(getattr(panel, "intro_image_url", "") or "").strip()
+        if intro_img and (intro_img.startswith("http://") or intro_img.startswith("https://")):
+            embed.set_image(url=intro_img)
+
+    if isinstance(answers_dict, dict):
+        for label, value in answers_dict.items():
+            display_val = str(value).strip() if value is not None and str(value).strip() else "*Non renseigné*"
+            embed.add_field(name=str(label)[:256], value=display_val[:1024], inline=False)
+
+    intro_footer = getattr(panel, "intro_footer_text", None) if panel else None
+    if not intro_footer or not str(intro_footer).strip():
+        intro_footer = f"Système de Ticketing - {ticket_name} (ID: {ticket_id})"
+    embed.set_footer(text=str(intro_footer)[:2048])
+
+    pings = []
+    if (panel is None or getattr(panel, "ping_creator", True)) and creator_id:
+        pings.append(f"<@{creator_id}>")
+    if panel and panel.ping_role_id:
+        try:
+            r_id = int(str(panel.ping_role_id).strip())
+            if r_id > 0:
+                pings.append(f"<@&{r_id}>")
+        except Exception:
+            pass
+
+    content = " ".join(pings) if pings else None
+    return embed, content
+
+
+def resolve_guild_for_panel(bot_client: discord.Client, panel: Optional[Panel]) -> Optional[discord.Guild]:
+    """Trouve le serveur Discord associé à un panel."""
+    if panel:
+        for attr in ("active_category_id", "archive_category_id", "deployed_channel_id"):
+            val = getattr(panel, attr, None)
+            if val:
+                try:
+                    cid = int(str(val).strip())
+                    ch = bot_client.get_channel(cid)
+                    if ch and getattr(ch, "guild", None):
+                        return ch.guild
+                except Exception:
+                    pass
+    if bot_client.guilds:
+        return bot_client.guilds[0]
+    return None
+
+
+async def process_ticket_creation(
+    interaction: discord.Interaction,
+    panel: Panel,
+    answers_dict: dict,
+    uploaded_attachments: Optional[list] = None,
+):
+    """Crée le salon de ticket (avec gestion de débordement > 50 salons), enregistre le ticket en BDD et envoie l'embed récapitulatif."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # 1. Résolution de la catégorie active principale et construction des permissions exactes
+    base_cat = await get_base_category(guild, panel.active_category_id if panel else None, interaction.client)
+    overwrites, _ = await build_ticket_channel_overwrites(guild, base_cat, interaction.user.id, panel)
+    overwrites[interaction.user] = discord.PermissionOverwrite(
+        read_messages=True, send_messages=True, attach_files=True, embed_links=True
+    )
 
     # 2. Création du ticket en BDD pour obtenir son nom incrémenté par utilisateur (<pseudo>-001, 002, ...)
     async with AsyncSessionLocal() as session:
@@ -667,10 +990,14 @@ async def process_ticket_creation(
         await session.flush()
         ticket_id = ticket.id
 
-        # 3. Création du salon textuel avec le nom personnalisé
+        # 3. Création du salon textuel avec débordement automatique (ticket (2), etc.)
         try:
-            channel = await guild.create_text_channel(
-                name=ticket_name, category=category, overwrites=overwrites
+            channel = await create_ticket_channel_with_overflow(
+                guild=guild,
+                channel_name=ticket_name,
+                base_category_id=panel.active_category_id if panel else None,
+                overwrites=overwrites,
+                bot_client=interaction.client,
             )
             ticket.channel_id = channel.id
             await session.commit()
@@ -772,6 +1099,154 @@ async def process_ticket_creation(
         await channel.send(content=content, embed=embed, view=TicketView(panel))
 
     await interaction.followup.send(f"✅ Ticket ouvert : {channel.mention}", ephemeral=True)
+
+    # 8. Envoi du log d'ouverture dans le salon de logs si activé
+    try:
+        actor_disp = f"{interaction.user.mention} (`{interaction.user.display_name or interaction.user.name}`)"
+        await send_ticket_log(
+            bot_client=interaction.client,
+            action="open",
+            ticket=ticket,
+            panel=panel,
+            source="discord",
+            actor_display=actor_disp,
+            channel_id=channel.id,
+        )
+    except Exception as log_err:
+        logger.warning(f"Erreur envoi log ouverture ticket: {log_err}")
+
+
+_explicitly_deleted_channel_ids = set()
+
+
+async def send_ticket_log(
+    bot_client: discord.Client,
+    action: str,
+    ticket: Ticket,
+    panel: Optional[Panel] = None,
+    source: str = "discord",
+    actor_display: str = "Utilisateur inconnu",
+    close_reason: Optional[str] = None,
+    recreated: bool = False,
+    channel_id: Optional[int] = None,
+    transcript_html: Optional[str] = None,
+):
+    """
+    Envoie un Embed de journalisation dans le salon de logs configuré (si `logs_enabled` est activé).
+    `action` : 'open' | 'close' | 'reopen' | 'delete'
+    `source` : 'discord' | 'web'
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(BotSettings).where(BotSettings.key == "global"))
+            settings = res.scalar_one_or_none()
+            if not settings or not settings.logs_enabled or not settings.logs_channel_id:
+                return
+            log_channel_id = int(settings.logs_channel_id)
+    except Exception as db_err:
+        logger.warning(f"Impossible de lire les paramètres de logs: {db_err}")
+        return
+
+    log_channel = bot_client.get_channel(log_channel_id)
+    if not log_channel:
+        try:
+            log_channel = await bot_client.fetch_channel(log_channel_id)
+        except Exception as fetch_err:
+            logger.warning(f"Salon de logs {log_channel_id} introuvable: {fetch_err}")
+            return
+
+    t_name = getattr(ticket, "ticket_name", None) or f"ticket{ticket.id:03d}"
+    panel_name = panel.name if (panel and getattr(panel, "name", None)) else "Panel par défaut"
+    source_badge = "💬 Discord" if source == "discord" else "🌐 Interface Web"
+    eff_channel_id = channel_id or getattr(ticket, "channel_id", None)
+
+    creator_str = "Inconnu"
+    if getattr(ticket, "creator_id", None):
+        c_uname = getattr(ticket, "creator_username", None) or "Membre"
+        creator_str = f"<@{ticket.creator_id}> (`{c_uname}`)"
+    elif getattr(ticket, "creator_username", None):
+        creator_str = f"`{ticket.creator_username}`"
+
+    action_meta = {
+        "open": ("🟢 Ouverture de Ticket", 0x10B981, "Ouvert par"),
+        "close": ("🟠 Fermeture de Ticket", 0xF59E0B, "Fermé par"),
+        "reopen": ("🔵 Ré-ouverture de Ticket", 0x3B82F6, "Ré-ouvert par"),
+        "delete": ("🔴 Suppression de Ticket", 0xEF4444, "Supprimé par"),
+    }
+    title_prefix, color_hex, actor_field_label = action_meta.get(
+        action, ("📋 Événement Ticket", 0x5865F2, "Effectué par")
+    )
+
+    embed = discord.Embed(
+        title=f"{title_prefix} — {t_name}",
+        color=discord.Color(color_hex),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    ticket_val = f"**`{t_name}`** (ID: `#{ticket.id}`)"
+    if eff_channel_id and action != "delete":
+        ticket_val += f"\nSalon : <#{eff_channel_id}>"
+
+    embed.add_field(name="🎫 Ticket", value=ticket_val, inline=True)
+    embed.add_field(name="📂 Panel", value=f"**{panel_name}**", inline=True)
+    embed.add_field(name="📍 Depuis", value=f"**{source_badge}**", inline=True)
+    embed.add_field(name="👤 Créateur du ticket", value=creator_str, inline=True)
+    embed.add_field(name=f"⚡ {actor_field_label}", value=actor_display or "Non spécifié", inline=True)
+
+    if action == "open":
+        answers = getattr(ticket, "form_answers", None)
+        if isinstance(answers, dict) and answers:
+            summary_lines = []
+            for k, v in list(answers.items())[:5]:
+                val_clean = str(v).strip()
+                if len(val_clean) > 120:
+                    val_clean = val_clean[:117] + "..."
+                summary_lines.append(f"• **{k}** : {val_clean}")
+            if summary_lines:
+                embed.add_field(
+                    name="📋 Réponses au formulaire",
+                    value="\n".join(summary_lines)[:1024],
+                    inline=False,
+                )
+
+    elif action == "close":
+        reason_clean = str(close_reason).strip() if (close_reason and str(close_reason).strip()) else None
+        embed.add_field(
+            name="📝 Motif de fermeture",
+            value=f"> {reason_clean}"[:1024] if reason_clean else "*Aucun motif renseigné (fermeture simple)*",
+            inline=False,
+        )
+
+    elif action == "reopen":
+        detail_msg = (
+            "✨ **Salon recréé automatiquement** dans la catégorie active avec tous ses droits d'origine (le salon précédent avait été supprimé)."
+            if recreated
+            else "🔄 Salon restauré depuis la catégorie d'archive vers la catégorie active."
+        )
+        embed.add_field(name="ℹ️ Détails de la ré-ouverture", value=detail_msg, inline=False)
+
+    elif action == "delete":
+        last_reason = getattr(ticket, "close_reason", None)
+        if last_reason:
+            embed.add_field(
+                name="📝 Dernier motif de fermeture enregistré",
+                value=f"> {last_reason}"[:1024],
+                inline=False,
+            )
+
+    embed.set_footer(text=f"Logs de Ticketing • Action via {'Discord' if source == 'discord' else 'Interface Web'}")
+
+    try:
+        if action == "close" and transcript_html:
+            file = discord.File(
+                io.BytesIO(transcript_html.encode()),
+                filename=f"transcript-{t_name}.html",
+            )
+            await log_channel.send(embed=embed, file=file)
+        else:
+            await log_channel.send(embed=embed)
+    except Exception as send_err:
+        logger.warning(f"Erreur lors de l'envoi du log de ticket dans #{getattr(log_channel, 'name', log_channel_id)}: {send_err}")
 
 
 async def send_dm_transcript_to_creator(
@@ -956,20 +1431,19 @@ async def execute_ticket_close(interaction: discord.Interaction, close_reason: O
             except Exception:
                 pass
 
-        # Déplacer vers la catégorie d'archive si configurée
+        # Déplacer vers la catégorie d'archive si configurée (avec gestion du débordement archive (2), etc.)
         if panel and panel.archive_category_id:
             try:
-                arch_id = int(str(panel.archive_category_id).strip())
-                cat = interaction.guild.get_channel(arch_id) or discord.utils.get(interaction.guild.categories, id=arch_id)
-                if not cat:
-                    try:
-                        cat = await interaction.client.fetch_channel(arch_id)
-                    except Exception:
-                        pass
-                if cat:
-                    await channel.edit(category=cat)
+                await move_channel_with_overflow(channel, panel.archive_category_id, interaction.client)
             except Exception as e:
                 logger.warning(f"Erreur déplacement archive: {e}")
+
+        # Rééquilibrer et nettoyer la catégorie active (supprime ticket (2) si on repasse <= 50 salons)
+        if panel and panel.active_category_id:
+            try:
+                await cleanup_and_rebalance_category_family(interaction.guild, panel.active_category_id, interaction.client)
+            except Exception as e:
+                logger.warning(f"Erreur nettoyage catégorie active: {e}")
 
         # 1. Enlever TOUS les boutons 'Fermer' et 'Fermer avec raison' du salon
         await remove_close_buttons_from_channel(channel)
@@ -1010,6 +1484,23 @@ async def execute_ticket_close(interaction: discord.Interaction, close_reason: O
             await channel.send(embed=embed, file=file, view=ArchivedTicketView(panel))
         else:
             await channel.send(embed=embed, view=ArchivedTicketView(panel))
+
+        # 4. Envoi du log de fermeture dans le salon de logs si activé
+        try:
+            actor_disp = f"{interaction.user.mention} (`{closer_name}`)"
+            await send_ticket_log(
+                bot_client=interaction.client,
+                action="close",
+                ticket=ticket,
+                panel=panel,
+                source="discord",
+                actor_display=actor_disp,
+                close_reason=clean_reason,
+                channel_id=channel.id,
+                transcript_html=transcript,
+            )
+        except Exception as log_err:
+            logger.warning(f"Erreur envoi log fermeture ticket: {log_err}")
 
 
 class CloseReasonModal(discord.ui.Modal, title="Fermer le ticket avec raison"):
@@ -1142,6 +1633,124 @@ class TicketView(discord.ui.View):
         await interaction.response.send_modal(CloseReasonModal())
 
 
+class ConfirmDeleteTicketView(discord.ui.View):
+    def __init__(self, ticket_id: Optional[int], panel_id: Optional[int], channel_id: int, user_id: int):
+        super().__init__(timeout=60)
+        self.ticket_id = ticket_id
+        self.panel_id = panel_id
+        self.channel_id = channel_id
+        self.user_id = user_id
+
+    @discord.ui.button(label="Confirmer la suppression", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message(
+                "❌ Seul l'utilisateur ayant cliqué sur Supprimer peut confirmer.",
+                ephemeral=True
+            )
+
+        # Désactiver les boutons de confirmation et indiquer la suppression
+        await interaction.response.edit_message(
+            content="🗑️ Suppression confirmée. Suppression du salon en cours...",
+            embed=None,
+            view=None
+        )
+
+        channel = interaction.channel or (interaction.guild.get_channel(self.channel_id) if interaction.guild else None)
+        guild = interaction.guild
+
+        ticket = None
+        panel = None
+        async with AsyncSessionLocal() as session:
+            if self.ticket_id:
+                ticket = await session.get(Ticket, self.ticket_id)
+            elif channel:
+                ticket = await find_ticket_for_channel(session, channel)
+
+            if ticket:
+                panel = await session.get(Panel, ticket.panel_id)
+            elif self.panel_id:
+                panel = await session.get(Panel, self.panel_id)
+
+            if not is_staff(interaction.user, panel):
+                return await interaction.followup.send(
+                    "❌ Seuls les membres du staff peuvent supprimer définitivement ce ticket.",
+                    ephemeral=True
+                )
+
+            if ticket and channel:
+                _explicitly_deleted_channel_ids.add(channel.id)
+                ticket.channel_id = None
+                ticket.status = "closed"
+                ticket.updated_at = datetime.datetime.utcnow()
+                await session.commit()
+
+        # Envoi du log de suppression dans le salon de logs si activé
+        if ticket:
+            try:
+                actor_disp = f"{interaction.user.mention} (`{interaction.user.display_name or interaction.user.name}`)"
+                await send_ticket_log(
+                    bot_client=interaction.client,
+                    action="delete",
+                    ticket=ticket,
+                    panel=panel,
+                    source="discord",
+                    actor_display=actor_disp,
+                    channel_id=channel.id if channel else self.channel_id,
+                )
+            except Exception as log_err:
+                logger.warning(f"Erreur envoi log suppression ticket: {log_err}")
+
+        if channel:
+            embed = discord.Embed(
+                description=f"🗑️ Ticket supprimé par {interaction.user.mention}. Fermeture dans 3 secondes...",
+                color=discord.Color.red()
+            )
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.warning(f"Impossible d'envoyer le message de suppression: {e}")
+
+            await asyncio.sleep(3)
+            try:
+                await channel.delete()
+            except Exception as e:
+                logger.warning(f"Impossible de supprimer le salon {channel.id}: {e}")
+
+        # Rééquilibrer et nettoyer les catégories en double si on repasse <= 50 salons
+        if guild and panel:
+            if panel.archive_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(guild, panel.archive_category_id, interaction.client)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie archive après suppression: {e}")
+            if panel.active_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(guild, panel.active_category_id, interaction.client)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie active après suppression: {e}")
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message(
+                "❌ Action non autorisée.",
+                ephemeral=True
+            )
+        await interaction.response.edit_message(
+            content="✅ Suppression annulée. Le ticket est conservé.",
+            embed=None,
+            view=None
+        )
+
+    async def on_timeout(self):
+        try:
+            for child in self.children:
+                child.disabled = True
+        except Exception:
+            pass
+
+
 class ArchivedTicketView(discord.ui.View):
     def __init__(self, panel: Panel = None):
         super().__init__(timeout=None)
@@ -1208,20 +1817,19 @@ class ArchivedTicketView(discord.ui.View):
                     member, read_messages=True, send_messages=True, attach_files=True, embed_links=True
                 )
             
-            # Déplacer vers la catégorie active si configurée
+            # Déplacer vers la catégorie active si configurée (avec gestion du débordement ticket (2), etc.)
             if panel and panel.active_category_id:
                 try:
-                    act_id = int(str(panel.active_category_id).strip())
-                    cat = interaction.guild.get_channel(act_id) or discord.utils.get(interaction.guild.categories, id=act_id)
-                    if not cat:
-                        try:
-                            cat = await interaction.client.fetch_channel(act_id)
-                        except Exception:
-                            pass
-                    if cat:
-                        await channel.edit(category=cat)
+                    await move_channel_with_overflow(channel, panel.active_category_id, interaction.client)
                 except Exception as e:
                     logger.warning(f"Erreur déplacement catégorie active: {e}")
+
+            # Rééquilibrer et nettoyer la catégorie d'archive (supprime archive (2) si on repasse <= 50 salons)
+            if panel and panel.archive_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(interaction.guild, panel.archive_category_id, interaction.client)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie archive: {e}")
 
         # Enlever TOUS les boutons d'archive du salon
         await remove_archive_buttons_from_channel(channel)
@@ -1229,8 +1837,23 @@ class ArchivedTicketView(discord.ui.View):
         # Envoyer le message de réouverture avec les boutons Fermer / Fermer avec raison
         await channel.send(f"🔓 Ticket réouvert par {interaction.user.mention}", view=TicketView(panel))
 
+        # Envoi du log de ré-ouverture dans le salon de logs si activé
+        try:
+            actor_disp = f"{interaction.user.mention} (`{interaction.user.display_name or interaction.user.name}`)"
+            await send_ticket_log(
+                bot_client=interaction.client,
+                action="reopen",
+                ticket=ticket,
+                panel=panel,
+                source="discord",
+                actor_display=actor_disp,
+                recreated=False,
+                channel_id=channel.id,
+            )
+        except Exception as log_err:
+            logger.warning(f"Erreur envoi log ré-ouverture ticket: {log_err}")
+
     async def delete(self, interaction: discord.Interaction):
-        await interaction.response.defer()
         channel = interaction.channel
 
         # SÉCURITÉ : Seuls les membres du staff peuvent supprimer définitivement
@@ -1238,19 +1861,40 @@ class ArchivedTicketView(discord.ui.View):
             ticket = await find_ticket_for_channel(session, channel)
             panel = await session.get(Panel, ticket.panel_id) if ticket else None
 
-        if not is_staff(interaction.user, panel):
-            return await interaction.followup.send(
-                "❌ Seuls les membres du staff peuvent supprimer définitivement ce ticket.", 
-                ephemeral=True
-            )
+            if not is_staff(interaction.user, panel):
+                if interaction.response.is_done():
+                    return await interaction.followup.send(
+                        "❌ Seuls les membres du staff peuvent supprimer définitivement ce ticket.", 
+                        ephemeral=True
+                    )
+                else:
+                    return await interaction.response.send_message(
+                        "❌ Seuls les membres du staff peuvent supprimer définitivement ce ticket.", 
+                        ephemeral=True
+                    )
 
+        # Étape de confirmation pour éviter les miss-clicks
         embed = discord.Embed(
-            description=f"🗑️ Ticket supprimé par {interaction.user.mention}. Fermeture dans 3 secondes...",
-            color=discord.Color.red()
+            title="⚠️ Confirmation de suppression",
+            description=(
+                f"Êtes-vous sûr de vouloir supprimer définitivement le ticket **#{getattr(channel, 'name', 'ce-ticket')}** ?\n\n"
+                f"• Le salon Discord sera supprimé.\n"
+                f"• L'historique et l'archive HTML restent consultables sur le site web.\n"
+                f"• Vous pourrez recréer le salon à tout moment depuis le site web si besoin."
+            ),
+            color=0xED4245
         )
-        await channel.send(embed=embed)
-        await asyncio.sleep(3)
-        await channel.delete()
+        view = ConfirmDeleteTicketView(
+            ticket_id=ticket.id if ticket else None,
+            panel_id=panel.id if panel else None,
+            channel_id=channel.id,
+            user_id=interaction.user.id
+        )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class TicketingBot(commands.Bot):
@@ -1273,6 +1917,56 @@ class TicketingBot(commands.Bot):
         )
 
 bot = TicketingBot()
+
+
+@bot.listen("on_guild_channel_delete")
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    """Synchronise la BDD, envoie un log si supprimé manuellement sur Discord, et nettoie les catégories de débordement."""
+    if not isinstance(channel, discord.TextChannel):
+        return
+    was_explicit = channel.id in _explicitly_deleted_channel_ids
+    _explicitly_deleted_channel_ids.discard(channel.id)
+    try:
+        panel = None
+        ticket = None
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(Ticket).where(Ticket.channel_id == channel.id))
+            ticket = res.scalar_one_or_none()
+            if ticket:
+                panel = await session.get(Panel, ticket.panel_id) if ticket.panel_id else None
+                ticket.channel_id = None
+                ticket.status = "closed"
+                ticket.updated_at = datetime.datetime.utcnow()
+                await session.commit()
+                logger.info(f"🗑️ Salon #{channel.name} ({channel.id}) supprimé sur Discord -> ticket #{ticket.id} marqué sans salon.")
+
+        if ticket and not was_explicit:
+            actor_disp = "Suppression manuelle sur Discord"
+            try:
+                async for entry in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_delete):
+                    if entry.target and getattr(entry.target, "id", None) == channel.id and entry.user:
+                        actor_disp = f"{entry.user.mention} (`{entry.user.display_name or entry.user.name}`)"
+                        break
+            except Exception:
+                pass
+            await send_ticket_log(
+                bot_client=bot,
+                action="delete",
+                ticket=ticket,
+                panel=panel,
+                source="discord",
+                actor_display=actor_disp,
+                channel_id=channel.id,
+            )
+
+        if panel and channel.guild:
+            if panel.archive_category_id:
+                await cleanup_and_rebalance_category_family(channel.guild, panel.archive_category_id, bot)
+            if panel.active_category_id:
+                await cleanup_and_rebalance_category_family(channel.guild, panel.active_category_id, bot)
+    except Exception as e:
+        logger.warning(f"Erreur dans on_guild_channel_delete: {e}")
+
 
 @bot.listen("on_interaction")
 async def on_interaction(interaction: discord.Interaction):

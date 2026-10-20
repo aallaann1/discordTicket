@@ -206,3 +206,14 @@ class Announcement(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class BotSettings(Base):
+    """Paramètres globaux du Bot Discord (ex: Logs des tickets)"""
+    __tablename__ = 'bot_settings'
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, index=True, default="global")
+    logs_enabled = Column(Boolean, default=False)
+    logs_channel_id = Column(BigInteger, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+

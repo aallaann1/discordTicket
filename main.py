@@ -13,12 +13,12 @@ import datetime
 from sqlalchemy.future import select
 from sqlalchemy import func, text, delete, or_
 
-from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement
-from bot import bot, PanelView, build_panel_embed, build_info_embed, build_announcement_embed
+from database import engine, Base, AsyncSessionLocal, Panel, FormField, Ticket, TicketArchive, InfoEmbed, Announcement, BotSettings
+from bot import bot, PanelView, build_panel_embed, build_info_embed, build_announcement_embed, send_ticket_log, _explicitly_deleted_channel_ids
 from schemas import PanelCreate, FieldCreate, BotProfileUpdate, InfoEmbedUpdate, AnnouncementCreate, AnnouncementUpdate
 from migrator import auto_migrate_db
 
-load_dotenv()
+load_dotenv(override=True)
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -26,6 +26,7 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(api_key: str = Security(api_key_header)):
+    load_dotenv(override=True)
     expected_key = os.getenv("API_KEY")
     if not expected_key:
         raise HTTPException(status_code=500, detail="API_KEY non configurée.")
@@ -120,10 +121,20 @@ def field_to_dict(f: FormField) -> dict:
     }
 
 def ticket_to_dict(t: Ticket) -> dict:
+    ch_exists = False
+    if t.channel_id:
+        try:
+            if bot.is_ready():
+                ch_exists = bot.get_channel(int(t.channel_id)) is not None
+            else:
+                ch_exists = True
+        except Exception:
+            ch_exists = False
     return {
         "id": t.id,
         "panel_id": t.panel_id,
-        "channel_id": str(t.channel_id) if t.channel_id else None,
+        "channel_id": str(t.channel_id) if (t.channel_id and ch_exists) else None,
+        "channel_exists": ch_exists,
         "creator_id": str(t.creator_id) if t.creator_id else None,
         "creator_username": getattr(t, "creator_username", None),
         "ticket_name": getattr(t, "ticket_name", None) or f"ticket{t.id:03d}",
@@ -245,11 +256,21 @@ async def lifespan(app: FastAPI):
                 raise
             await asyncio.sleep(2)
             
+    load_dotenv(override=True)
     token = os.getenv("DISCORD_BOT_TOKEN")
+    bot_task = None
     if token:
-        asyncio.create_task(bot.start(token))
+        bot_task = asyncio.create_task(bot.start(token.strip()))
     
     yield
+
+    try:
+        if not bot.is_closed():
+            await bot.close()
+        if bot_task and not bot_task.done():
+            bot_task.cancel()
+    except Exception as e:
+        logger.warning(f"[Shutdown] Erreur fermeture bot: {e}")
 
 app = FastAPI(title="Discord Ticket API", lifespan=lifespan)
 
@@ -1284,15 +1305,96 @@ async def get_tickets(limit: Optional[int] = Query(None), offset: int = 0):
                 pass
         return result
 
+def extract_web_actor(request: Request, body: Optional[dict] = None) -> tuple:
+    """Extrait le nom et l'email de l'utilisateur Web ayant déclenché l'action."""
+    actor_name = ""
+    actor_email = ""
+    if isinstance(body, dict):
+        actor_name = str(body.get("actor_name") or "").strip()
+        actor_email = str(body.get("actor_email") or "").strip()
+    if not actor_name:
+        actor_name = (request.headers.get("X-Actor-Name") or "").strip()
+    if not actor_email:
+        actor_email = (request.headers.get("X-Actor-Email") or "").strip()
+
+    if actor_name and actor_email and actor_name != actor_email:
+        display = f"👤 **{actor_name}** (`{actor_email}`)"
+        short = f"{actor_name} ({actor_email})"
+    elif actor_name:
+        display = f"👤 **{actor_name}**"
+        short = actor_name
+    elif actor_email:
+        display = f"👤 `{actor_email}`"
+        short = actor_email
+    else:
+        display = "👤 **Staff (Dashboard Web)**"
+        short = "Dashboard Web"
+    return display, short
+
+
+@app.get("/api/settings/logs", dependencies=[Depends(get_api_key)])
+async def get_logs_settings():
+    """Récupère l'état d'activation et le salon configuré pour les logs des tickets."""
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(BotSettings).where(BotSettings.key == "global"))
+        settings = res.scalar_one_or_none()
+        if not settings:
+            return {"logs_enabled": False, "logs_channel_id": ""}
+        return {
+            "logs_enabled": bool(settings.logs_enabled),
+            "logs_channel_id": str(settings.logs_channel_id) if settings.logs_channel_id else "",
+        }
+
+
+@app.put("/api/settings/logs", dependencies=[Depends(get_api_key)])
+async def update_logs_settings(request: Request):
+    """Met à jour l'activation des logs et le salon Discord de destination."""
+    body = await request.json()
+    logs_enabled = bool(body.get("logs_enabled", False))
+    raw_channel = body.get("logs_channel_id")
+    logs_channel_id = None
+    if raw_channel and str(raw_channel).strip():
+        try:
+            logs_channel_id = int(str(raw_channel).strip())
+        except ValueError:
+            raise HTTPException(400, detail="ID de salon invalide.")
+
+    if logs_enabled and not logs_channel_id:
+        raise HTTPException(400, detail="Veuillez sélectionner un salon Discord pour activer les logs.")
+
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(BotSettings).where(BotSettings.key == "global"))
+        settings = res.scalar_one_or_none()
+        if not settings:
+            settings = BotSettings(
+                key="global",
+                logs_enabled=logs_enabled,
+                logs_channel_id=logs_channel_id,
+            )
+            session.add(settings)
+        else:
+            settings.logs_enabled = logs_enabled
+            settings.logs_channel_id = logs_channel_id
+            settings.updated_at = datetime.datetime.utcnow()
+        await session.commit()
+        return {
+            "logs_enabled": bool(settings.logs_enabled),
+            "logs_channel_id": str(settings.logs_channel_id) if settings.logs_channel_id else "",
+        }
+
+
 @app.post("/api/tickets/{ticket_id}/close", dependencies=[Depends(get_api_key)])
 async def close_ticket(ticket_id: int, request: Request):
     close_reason = None
+    body = {}
     try:
         body = await request.json()
         if isinstance(body, dict) and body.get("reason"):
             close_reason = str(body.get("reason")).strip()
     except Exception:
         pass
+
+    actor_display, actor_short = extract_web_actor(request, body)
 
     async with AsyncSessionLocal() as session:
         ticket = await session.get(Ticket, ticket_id)
@@ -1341,7 +1443,7 @@ async def close_ticket(ticket_id: int, request: Request):
 
         ticket.status = "closed"
         ticket.updated_at = datetime.datetime.utcnow()
-        ticket.closed_by_username = "Dashboard Web"
+        ticket.closed_by_username = f"{actor_short} (Web)"
         if close_reason:
             ticket.close_reason = close_reason
         
@@ -1373,17 +1475,21 @@ async def close_ticket(ticket_id: int, request: Request):
             except Exception:
                 pass
 
-            # 3. Déplacer vers la catégorie archive si configurée
+            # 3. Déplacer vers la catégorie archive si configurée (avec gestion du débordement archive (2), etc.)
             if panel and panel.archive_category_id:
                 try:
-                    arch_id = int(str(panel.archive_category_id).strip())
-                    cat = channel.guild.get_channel(arch_id) or discord.utils.get(channel.guild.categories, id=arch_id)
-                    if not cat:
-                        cat = await bot.fetch_channel(arch_id)
-                    if cat:
-                        await channel.edit(category=cat)
+                    from bot import move_channel_with_overflow
+                    await move_channel_with_overflow(channel, panel.archive_category_id, bot)
                 except Exception as e:
                     logger.warning(f"Erreur déplacement archive: {e}")
+
+            # 3b. Rééquilibrer et nettoyer la catégorie active (supprime ticket (2) si on repasse <= 50 salons)
+            if panel and panel.active_category_id:
+                try:
+                    from bot import cleanup_and_rebalance_category_family
+                    await cleanup_and_rebalance_category_family(channel.guild, panel.active_category_id, bot)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie active: {e}")
 
             # 4. Envoyer le message d'archive avec boutons Ré-ouvrir et Supprimer
             try:
@@ -1412,12 +1518,316 @@ async def close_ticket(ticket_id: int, request: Request):
                         bot_client=bot,
                         ticket=ticket,
                         panel=panel,
-                        closed_by_display="le Staff (Dashboard Web)",
+                        closed_by_display=f"{actor_short} (Interface Web)",
                         close_reason=close_reason,
                         transcript_html=transcript
                     )
             except Exception as e:
                 logger.warning(f"Erreur envoi message archive: {e}")
+
+        # 6. Envoi du log de fermeture dans le salon de logs si activé
+        try:
+            await send_ticket_log(
+                bot_client=bot,
+                action="close",
+                ticket=ticket,
+                panel=panel,
+                source="web",
+                actor_display=actor_display,
+                close_reason=close_reason,
+                channel_id=channel.id if channel else None,
+                transcript_html=transcript,
+            )
+        except Exception as log_err:
+            logger.warning(f"Erreur envoi log fermeture web: {log_err}")
+
+        return ticket_to_dict(ticket)
+
+
+@app.post("/api/tickets/{ticket_id}/reopen", dependencies=[Depends(get_api_key)])
+async def reopen_ticket(ticket_id: int, request: Request):
+    """
+    Ré-ouvre un ticket depuis l'interface Web.
+    - Si le salon Discord existe encore (en archive), restaure les permissions du créateur et le déplace vers la catégorie active (ou ticket (2)).
+    - Si le salon Discord a été supprimé, le recrée au bon endroit (catégorie active ou ticket (2)) avec exactement tous les bons droits,
+      reposte l'embed récapitulatif du ticket avec les boutons Fermer / Fermer avec raison, et joint l'archive précédente si disponible.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    actor_display, actor_short = extract_web_actor(request, body)
+    import io
+    from bot import (
+        TicketView,
+        remove_archive_buttons_from_channel,
+        move_channel_with_overflow,
+        cleanup_and_rebalance_category_family,
+        get_base_category,
+        build_ticket_channel_overwrites,
+        create_ticket_channel_with_overflow,
+        build_ticket_welcome_embed_and_pings,
+        resolve_guild_for_panel,
+    )
+
+    async with AsyncSessionLocal() as session:
+        ticket = await session.get(Ticket, ticket_id)
+        if not ticket:
+            raise HTTPException(404, detail="Ticket introuvable.")
+
+        panel = await session.get(Panel, ticket.panel_id) if ticket.panel_id else None
+
+        # 1. Vérifier si le salon Discord existe encore
+        channel = None
+        if ticket.channel_id:
+            try:
+                channel = bot.get_channel(int(ticket.channel_id)) or await bot.fetch_channel(int(ticket.channel_id))
+            except Exception:
+                channel = None
+
+        # Fallback recherche par nom si l'ID n'est plus valide mais que le salon existe
+        if not channel:
+            candidates = []
+            if getattr(ticket, "ticket_name", None):
+                candidates.append(ticket.ticket_name)
+            candidates.append(f"ticket{ticket.id:03d}")
+            for g in bot.guilds:
+                for target_name in candidates:
+                    ch = discord.utils.get(g.text_channels, name=target_name)
+                    if ch:
+                        channel = ch
+                        ticket.channel_id = ch.id
+                        break
+                if channel:
+                    break
+
+        recreated = False
+
+        if channel:
+            # --- CAS A : Le salon existe encore sur Discord ---
+            guild = channel.guild
+            # Restaurer les permissions du membre créateur
+            if ticket.creator_id:
+                try:
+                    member = guild.get_member(int(ticket.creator_id))
+                    if not member:
+                        member = await guild.fetch_member(int(ticket.creator_id))
+                    if member:
+                        await channel.set_permissions(
+                            member,
+                            read_messages=True,
+                            send_messages=True,
+                            attach_files=True,
+                            embed_links=True,
+                        )
+                except Exception as perm_err:
+                    logger.warning(f"Impossible de restaurer les permissions du créateur {ticket.creator_id}: {perm_err}")
+
+            # Déplacer vers la catégorie active (avec débordement ticket (2) si pleine)
+            if panel and panel.active_category_id:
+                try:
+                    await move_channel_with_overflow(channel, panel.active_category_id, bot)
+                except Exception as move_err:
+                    logger.warning(f"Erreur déplacement vers catégorie active lors de la réouverture: {move_err}")
+
+            # Rééquilibrer et nettoyer la catégorie d'archive (supprime archive (2) si on repasse <= 50 salons)
+            if panel and panel.archive_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(guild, panel.archive_category_id, bot)
+                except Exception as clean_err:
+                    logger.warning(f"Erreur nettoyage catégorie archive lors de la réouverture: {clean_err}")
+
+            # Retirer les boutons d'archive (Ré-ouvrir / Supprimer)
+            try:
+                await remove_archive_buttons_from_channel(channel)
+            except Exception:
+                pass
+
+            # Envoyer le message de réouverture avec les boutons Fermer / Fermer avec raison
+            creator_mention = f" (<@{ticket.creator_id}>)" if ticket.creator_id else ""
+            await channel.send(
+                f"🔓 Ticket ré-ouvert depuis le **Dashboard Web**{creator_mention}.",
+                view=TicketView(panel),
+            )
+        else:
+            # --- CAS B : Le salon avait été supprimé de Discord -> On le recrée au bon endroit avec tous ses droits ! ---
+            guild = resolve_guild_for_panel(bot, panel)
+            if not guild:
+                raise HTTPException(500, detail="Aucun serveur Discord disponible pour recréer le salon.")
+
+            base_cat = await get_base_category(guild, panel.active_category_id if panel else None, bot)
+            overwrites, _ = await build_ticket_channel_overwrites(guild, base_cat, ticket.creator_id, panel)
+
+            ticket_name = getattr(ticket, "ticket_name", None) or f"ticket{ticket.id:03d}"
+
+            try:
+                channel = await create_ticket_channel_with_overflow(
+                    guild=guild,
+                    channel_name=ticket_name,
+                    base_category_id=panel.active_category_id if panel else None,
+                    overwrites=overwrites,
+                    bot_client=bot,
+                )
+                recreated = True
+                ticket.channel_id = channel.id
+            except Exception as create_err:
+                logger.error(f"Erreur lors de la recréation du salon de ticket #{ticket.id}: {create_err}")
+                raise HTTPException(500, detail=f"Impossible de recréer le salon Discord : {create_err}")
+
+            # Poster l'Embed d'accueil d'origine avec toutes les réponses et les boutons Fermer / Fermer avec raison
+            welcome_embed, pings_content = build_ticket_welcome_embed_and_pings(
+                panel=panel,
+                ticket_id=ticket.id,
+                ticket_name=ticket_name,
+                creator_id=ticket.creator_id,
+                answers_dict=ticket.form_answers if isinstance(ticket.form_answers, dict) else {},
+            )
+            await channel.send(content=pings_content, embed=welcome_embed, view=TicketView(panel))
+
+            # Joindre l'historique HTML précédent si une archive existait
+            res_arc = await session.execute(select(TicketArchive).where(TicketArchive.ticket_id == ticket.id))
+            archive = res_arc.scalar_one_or_none()
+            reopen_embed = discord.Embed(
+                title="🔓 Ticket Ré-ouvert & Salon Restauré",
+                description=(
+                    "Ce ticket avait été supprimé de Discord et vient d'être **ré-ouvert depuis le Dashboard Web**.\n"
+                    "Le salon a été recréé dans la catégorie active avec l'intégralité de ses permissions d'origine."
+                ),
+                color=discord.Color.green(),
+            )
+            if archive and archive.html_content:
+                reopen_embed.add_field(
+                    name="📜 Historique précédent",
+                    value="La retranscription des échanges précédents est jointe ci-dessous et reste consultable sur le Dashboard Web.",
+                    inline=False,
+                )
+                hist_file = discord.File(
+                    io.BytesIO(archive.html_content.encode()),
+                    filename=f"transcript-historique-{ticket.id}.html",
+                )
+                await channel.send(embed=reopen_embed, file=hist_file)
+            else:
+                await channel.send(embed=reopen_embed)
+
+        ticket.status = "open"
+        ticket.close_reason = None
+        ticket.closed_by_username = None
+        ticket.updated_at = datetime.datetime.utcnow()
+        await session.commit()
+
+        # Envoi du log de ré-ouverture dans le salon de logs si activé
+        try:
+            await send_ticket_log(
+                bot_client=bot,
+                action="reopen",
+                ticket=ticket,
+                panel=panel,
+                source="web",
+                actor_display=actor_display,
+                recreated=recreated,
+                channel_id=channel.id if channel else None,
+            )
+        except Exception as log_err:
+            logger.warning(f"Erreur envoi log ré-ouverture web: {log_err}")
+
+        result = ticket_to_dict(ticket)
+        result["recreated"] = recreated
+        return result
+
+
+@app.post("/api/tickets/{ticket_id}/delete-channel", dependencies=[Depends(get_api_key)])
+@app.delete("/api/tickets/{ticket_id}/channel", dependencies=[Depends(get_api_key)])
+async def delete_ticket_channel(ticket_id: int, request: Request):
+    """
+    Supprime le salon Discord d'un ticket depuis l'interface Web (tout en conservant le ticket et son archive sur le Web),
+    puis rééquilibre et supprime les éventuelles catégories en double (`archive (2)`, `ticket (2)`) si on repasse <= 50 salons.
+    """
+    from bot import cleanup_and_rebalance_category_family
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    actor_display, actor_short = extract_web_actor(request, body)
+
+    async with AsyncSessionLocal() as session:
+        ticket = await session.get(Ticket, ticket_id)
+        if not ticket:
+            raise HTTPException(404, detail="Ticket introuvable.")
+
+        panel = await session.get(Panel, ticket.panel_id) if ticket.panel_id else None
+
+        channel = None
+        if ticket.channel_id:
+            try:
+                channel = bot.get_channel(int(ticket.channel_id)) or await bot.fetch_channel(int(ticket.channel_id))
+            except Exception:
+                channel = None
+
+        guild = channel.guild if channel else None
+        deleted_channel_id = channel.id if channel else ticket.channel_id
+
+        if channel:
+            _explicitly_deleted_channel_ids.add(channel.id)
+            # Sauvegarder une dernière fois le transcript HTML si aucune archive n'existe encore
+            try:
+                res_arc = await session.execute(select(TicketArchive).where(TicketArchive.ticket_id == ticket.id))
+                archive = res_arc.scalar_one_or_none()
+                if not archive or not archive.html_content:
+                    import chat_exporter
+                    transcript = await chat_exporter.export(
+                        channel,
+                        limit=None,
+                        tz_info="Europe/Paris",
+                        military_time=True,
+                        bot=bot,
+                    )
+                    if transcript:
+                        if archive:
+                            archive.html_content = transcript
+                        else:
+                            session.add(TicketArchive(ticket_id=ticket.id, html_content=transcript))
+            except Exception as arc_err:
+                logger.warning(f"Impossible d'exporter le transcript avant suppression du salon #{ticket.id}: {arc_err}")
+
+            try:
+                await channel.delete(reason=f"Salon de ticket supprimé depuis le Dashboard Web par {actor_short}")
+            except Exception as del_err:
+                logger.warning(f"Erreur lors de la suppression du salon Discord pour le ticket #{ticket.id}: {del_err}")
+
+        ticket.channel_id = None
+        ticket.status = "closed"
+        ticket.updated_at = datetime.datetime.utcnow()
+        await session.commit()
+
+        # Envoi du log de suppression dans le salon de logs si activé
+        try:
+            await send_ticket_log(
+                bot_client=bot,
+                action="delete",
+                ticket=ticket,
+                panel=panel,
+                source="web",
+                actor_display=actor_display,
+                channel_id=deleted_channel_id,
+            )
+        except Exception as log_err:
+            logger.warning(f"Erreur envoi log suppression web: {log_err}")
+
+        # Rééquilibrer et supprimer les catégories en double (`archive (2)`, `ticket (2)`) si on repasse <= 50 salons
+        if guild and panel:
+            if panel.archive_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(guild, panel.archive_category_id, bot)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie archive après suppression web: {e}")
+            if panel.active_category_id:
+                try:
+                    await cleanup_and_rebalance_category_family(guild, panel.active_category_id, bot)
+                except Exception as e:
+                    logger.warning(f"Erreur nettoyage catégorie active après suppression web: {e}")
 
         return ticket_to_dict(ticket)
 
